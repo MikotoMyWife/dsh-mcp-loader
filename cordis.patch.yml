@@ -1,0 +1,5 @@
+# Minimal bundle patch: users add their own MCP servers via plugin config,
+# see README.md → Configuration. Nothing personal lives in this repo.
+- insert:
+    - id: mcp-loader
+      name: dsh-mcp-loader
