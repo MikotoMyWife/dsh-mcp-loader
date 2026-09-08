@@ -1,3 +1,9 @@
+# Source-only repository: track code and the files required to build/install it.
+# Local docs (future documentation site), agent scaffolding and project
+# progress stay untracked here.
 node_modules/
-docs/ops/
+docs/
+.agents/
+.agents.md
+skills/
 *.tgz
