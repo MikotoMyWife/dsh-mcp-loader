@@ -1,10 +1,26 @@
 /**
  * Real MCP stdio server used by the e2e test.
  *
- * Exposes four tools over the real MCP SDK, including `add_tool`, which grows
+ * Exposes six tools over the real MCP SDK, including `add_tool`, which grows
  * the tool list at runtime and emits `notifications/tools/list_changed` so the
- * plugin's re-sync path is exercised end to end.
+ * plugin's re-sync path is exercised end to end, and `die`, which crashes the
+ * process so the transport-failure path is exercised too.
+ *
+ * Fault-injection and observability env (see the e2e coverage table):
+ * - `ECHO_FAIL_FIRST_CONNECT=1` + `ECHO_MARKER=<file>`: the first process that
+ *   atomically creates the marker (`openSync(..., 'wx')`) exits right after
+ *   boot, simulating a first-connect crash; every later process sees the
+ *   marker and serves normally.
+ * - `ECHO_LOG=<file>`: appends one line per event — `start` at boot and the
+ *   raw tool name for each `tools/call` — for deterministic process/call
+ *   counting.
+ * - `ECHO_EXIT_MARKER=<file>`: writes `closed` when the process exits, proving
+ *   an idle disconnect actually terminated it.
+ *
+ * Per-server disambiguation comes from `ECHO_LOG` pointing at a distinct file
+ * per server, so no extra id env is needed.
  */
+import fs from 'node:fs'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
@@ -39,6 +55,11 @@ const tools = [
     inputSchema: { type: 'object', properties: {} },
   },
   {
+    name: 'die',
+    description: 'Exits the fixture process immediately (simulates a server crash).',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
     name: 'add_tool',
     description: 'Adds a new tool named new_tool and announces the change.',
     inputSchema: { type: 'object', properties: {} },
@@ -56,6 +77,33 @@ const tools = [
   },
 ]
 
+const ECHO_LOG = process.env.ECHO_LOG
+const ECHO_EXIT_MARKER = process.env.ECHO_EXIT_MARKER
+
+function logLine(line) {
+  if (ECHO_LOG !== undefined) fs.appendFileSync(ECHO_LOG, `${line}\n`)
+}
+
+function markClosed() {
+  if (ECHO_EXIT_MARKER !== undefined) fs.writeFileSync(ECHO_EXIT_MARKER, 'closed')
+}
+
+process.on('exit', markClosed)
+
+logLine('start')
+
+// First-connect failure injection: whoever wins the atomic marker creation is
+// "the first attempt" and dies on arrival; retries spawn fresh processes that
+// serve normally.
+if (process.env.ECHO_FAIL_FIRST_CONNECT === '1' && process.env.ECHO_MARKER !== undefined) {
+  try {
+    fs.openSync(process.env.ECHO_MARKER, 'wx')
+    process.exit(1)
+  } catch {
+    // The marker already exists: an earlier process already played the crash.
+  }
+}
+
 const server = new Server(
   { name: 'echo-fixture', version: '1.0.0' },
   { capabilities: { tools: { listChanged: true } } },
@@ -65,6 +113,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }))
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params
+  logLine(name)
   switch (name) {
     case 'echo':
       return { content: [{ type: 'text', text: `echo:${String(args.text ?? '')}` }] }
@@ -81,6 +130,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [{ type: 'text', text: 'structured ok' }],
         structuredContent: { value: 'x', extra: 'not in the schema' },
       }
+    case 'die':
+      // Crash mid-call: the response never arrives and the client sees the
+      // transport die. Deliberately no response.
+      process.exit(1)
+      break
     case 'add_tool': {
       if (!tools.some((tool) => tool.name === 'new_tool')) {
         tools.push({
@@ -95,6 +149,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     default:
       return { content: [{ type: 'text', text: `unknown tool ${name}` }], isError: true }
   }
+})
+
+// Exit when the parent closes stdin (idle disconnect or harness teardown):
+// without this the child lingers until it is force-killed, and the exit marker
+// would never be written on Windows. This listener is registered before the
+// SDK transport's own stdin 'end' listener (registered by `connect` below), so
+// ours fires first and exits the process immediately.
+process.stdin.on('end', () => {
+  markClosed()
+  process.exit(0)
 })
 
 await server.connect(new StdioServerTransport())

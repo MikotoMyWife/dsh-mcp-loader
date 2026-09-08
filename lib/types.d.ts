@@ -63,6 +63,26 @@ export interface ServerConfig {
     headers?: Record<string, string>;
     /** Per `tools/call` deadline in milliseconds; defaults to 60_000. */
     toolCallTimeoutMs?: number;
+    /**
+     * How many times a failed connect or tool discovery is retried before the
+     * error is surfaced. `0` restores the v0.5.0 behavior (one attempt, fail
+     * fast). Only establish/discovery is retried — a failed `tools/call` is
+     * never replayed. Defaults to 1.
+     */
+    reconnectAttempts?: number;
+    /**
+     * Base delay in milliseconds before the first retry; every further retry
+     * doubles it (base × 2^n), capped at 30s. `0` retries immediately.
+     * Defaults to 500.
+     */
+    reconnectBackoffMs?: number;
+    /**
+     * Idle disconnect in milliseconds. When > 0 and this server currently has no
+     * loaded tools (an unload left it empty), its MCP connection is closed after
+     * this long; the next load reconnects lazily. `0` (default) keeps the
+     * always-warm v0.5.0 behavior — unload does not close the connection.
+     */
+    idleDisconnectMs?: number;
 }
 /** Plugin config. */
 export interface PluginConfig {

@@ -91,6 +91,9 @@ Then register the plugin in your profile (id `mcp-loader`, package `dsh-mcp-load
 | `servers.<n>.command`/`args`/`env`/`cwd` | — | stdio process to spawn |
 | `servers.<n>.url`/`headers` | — | streamable-http endpoint and extra headers |
 | `servers.<n>.toolCallTimeoutMs` | `60000` | Per `tools/call` timeout |
+| `servers.<n>.reconnectAttempts` | `1` | Per user-visible operation (a loader load, a tool call, a startup probe): retries after a failed connect/discovery — connect and discovery share one budget of `reconnectAttempts + 1` tries (`0` = exactly one attempt, v0.5.0 behavior) |
+| `servers.<n>.reconnectBackoffMs` | `500` | Base retry delay; each retry doubles it (×2ⁿ), capped at 30s |
+| `servers.<n>.idleDisconnectMs` | `0` | Close an unloaded server's MCP connection after this idle time (`0` = always warm); the next load reconnects |
 | `connectTimeoutMs` | `30000` | Connection handshake timeout |
 | `singleToolThreshold` | `1` | `auto` mode: servers with ≤ this many tools stay resident |
 | `loaderHint` | `Call to load this MCP server's tools; call again to hide them.` | Appended to every loader description |
@@ -102,7 +105,18 @@ Then register the plugin in your profile (id `mcp-loader`, package `dsh-mcp-load
 - Startup probing is a snapshot: a server that later grows past the threshold stays revealed until restart (pin it with `mode: lazy`).
 - Images/audio become `[image image/png]` text placeholders; only tools are bridged — MCP resources/prompts/
   progress and task-typed tools are not supported (consistent with `dsh-mcp-client`).
-- No active reconnect backoff; reconnection happens on the next call.
+- Reconnection is bounded and lazy: one user-visible operation (a loader load, a tool call, a startup probe) draws
+  from a single budget of `reconnectAttempts + 1` connect+discovery tries (`reconnectAttempts`/`reconnectBackoffMs`);
+  a failed `tools/call` is surfaced immediately and never replayed. There is no eager background keep-alive/reconnect —
+  an idle server with `idleDisconnectMs: 0` (the default) stays warm indefinitely, and one with `idleDisconnectMs > 0`
+  is disconnected only while it has no loaded tools, reconnecting on the next load.
+- Known lifecycle edges (accepted for now; a connection "generation" scheme is a later slice):
+  - Disconnecting while another caller is connecting can, in a narrow window, leave two spawned children and orphan
+    the losing one.
+  - An idle disconnect waits for a connect attempt already in flight (up to `connectTimeoutMs`) before closing; retries
+    that were only scheduled are cancelled instead of delaying the disconnect.
+  - With the default `reconnectAttempts: 1`, deterministic discovery errors (e.g. a duplicated tool name) are retried
+    once before surfacing; slice 03 adds explicit exclusions (DiscoveryLimitError and friends).
 
 ## Ecosystem position
 

@@ -75,6 +75,55 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
   const loaded = new Map<string, Map<string, () => void>>()
   /** server name -> in-flight load, so the startup probe and a loader call cannot double-register */
   const pending = new Map<string, Promise<Map<string, () => void>>>()
+  /** server name -> pending idle-disconnect timer (armed only while that server has no loaded tools) */
+  const idleTimers = new Map<string, NodeJS.Timeout>()
+  /** server name -> how many idle disconnects have fired for it (log counter) */
+  const idleDisconnectCount = new Map<string, number>()
+
+  /** Cancel a server's pending idle-disconnect timer, if any. */
+  function clearIdleTimer(serverName: string): void {
+    const timer = idleTimers.get(serverName)
+    if (timer === undefined) return
+    clearTimeout(timer)
+    idleTimers.delete(serverName)
+  }
+
+  /**
+   * Reconcile a server's idle timer after its loaded-tool count changed:
+   * disarm while tools are loaded; arm once the server is empty and
+   * `idleDisconnectMs > 0`, so an unloaded-but-connected server does not keep
+   * its MCP child alive forever. Firing soft-disconnects the connection; the
+   * next load reconnects lazily (config survives).
+   */
+  function reconcileIdleTimer(serverName: string): void {
+    clearIdleTimer(serverName)
+    const idleMs = serverConfigs[serverName]?.idleDisconnectMs ?? 0
+    if (idleMs <= 0) return
+    if ((loaded.get(serverName)?.size ?? 0) > 0) return
+    const connection = connections.get(serverName)
+    if (connection === undefined) return
+    // Nothing to disconnect when no connection exists yet (never loaded).
+    if (!connection.status().connected) return
+    const timer = setTimeout(() => {
+      idleTimers.delete(serverName)
+      // A load may have raced the timer: never disconnect a server that has
+      // tools again, and never disconnect mid-load.
+      if ((loaded.get(serverName)?.size ?? 0) > 0) return
+      if (pending.has(serverName)) {
+        reconcileIdleTimer(serverName)
+        return
+      }
+      if (!connection.status().connected) return
+      const ordinal = (idleDisconnectCount.get(serverName) ?? 0) + 1
+      idleDisconnectCount.set(serverName, ordinal)
+      void connection.disconnect().then(
+        () => logger.info(`[tool-aggregator] MCP server "${serverName}" disconnected after idle (#${ordinal})`),
+        (error) => logger.warn(`[tool-aggregator] idle disconnect of "${serverName}" failed: ${messageOf(error)}`),
+      )
+    }, idleMs)
+    timer.unref?.()
+    idleTimers.set(serverName, timer)
+  }
 
   /**
    * server name -> public tool names hidden from every agent once that server is
@@ -234,17 +283,26 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     const inflight = pending.get(connection.name)
     if (inflight !== undefined) return inflight
     const attempt = (async () => {
-      const discovered = await connection.listTools()
-      if (discovered.length === 0) {
-        const empty = new Map<string, () => void>()
-        loaded.set(connection.name, empty)
-        return empty
+      try {
+        const discovered = await connection.listTools()
+        if (discovered.length === 0) {
+          const empty = new Map<string, () => void>()
+          loaded.set(connection.name, empty)
+          clearIdleTimer(connection.name)
+          return empty
+        }
+        const generation = registerGeneration(connection, discovered)
+        loaded.set(connection.name, generation)
+        clearIdleTimer(connection.name)
+        restrictAllAgents(caller)
+        logger.info(`[tool-aggregator] loaded ${generation.size} tool(s) from "${connection.name}"`)
+        return generation
+      } catch (error) {
+        // A failed load may still have left the connection established while no
+        // tools are registered — exactly the idle candidate when the option is on.
+        reconcileIdleTimer(connection.name)
+        throw error
       }
-      const generation = registerGeneration(connection, discovered)
-      loaded.set(connection.name, generation)
-      restrictAllAgents(caller)
-      logger.info(`[tool-aggregator] loaded ${generation.size} tool(s) from "${connection.name}"`)
-      return generation
     })().finally(() => {
       pending.delete(connection.name)
     })
@@ -264,6 +322,9 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
         logger.warn(`[tool-aggregator] disposing a tool of "${serverName}" failed: ${messageOf(error)}`)
       }
     }
+    // An unloaded server is exactly the idle-disconnect candidate: arm the
+    // timer when `idleDisconnectMs` opts in (default 0 keeps it warm).
+    reconcileIdleTimer(serverName)
     return generation.size
   }
 
@@ -325,11 +386,13 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     }
     try {
       loaded.set(connection.name, registerGeneration(connection, discovered))
+      clearIdleTimer(connection.name)
     } catch (error) {
       loaded.delete(connection.name)
       logger.error(
         `[tool-aggregator] re-sync of "${connection.name}" could not re-register its tools: ${messageOf(error)}; that server is now unloaded`,
       )
+      reconcileIdleTimer(connection.name)
     }
   }
 
@@ -339,10 +402,18 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
       discovered = await connection.listTools(true)
     } catch (error) {
       logger.warn(`[tool-aggregator] re-sync of "${connection.name}" failed: ${messageOf(error)}`)
+      // A re-sync racing an idle disconnect has its retries cancelled, but a
+      // failure on a still-connected server leaves it unloaded and warm —
+      // re-arm the idle timer either way.
+      reconcileIdleTimer(connection.name)
       return
     }
     swapGeneration(connection, discovered)
     logger.info(`[tool-aggregator] re-synced "${connection.name}" (${discovered.length} tools)`)
+    // Normally a disarm/no-op (a re-sync only swaps an already-loaded
+    // generation). When it ends with no loaded tools — e.g. it raced an idle
+    // disconnect that a retry had revived — re-arming keeps the timer correct.
+    reconcileIdleTimer(connection.name)
   }
 
   /**
@@ -378,6 +449,9 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
         logger.info(
           `[tool-aggregator] "${connection.name}": ${discovered.length} tools hidden behind loader "${loaderNameOf(connection.name)}"`,
         )
+        // The probe connected a server that stays behind its loader: when the
+        // idle option is on, arm it so a never-loaded server is not warm forever.
+        reconcileIdleTimer(connection.name)
         continue
       }
       try {
@@ -423,6 +497,9 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     }
     loaded.clear()
     pending.clear()
+    for (const timer of idleTimers.values()) clearTimeout(timer)
+    idleTimers.clear()
+    idleDisconnectCount.clear()
     for (const connection of connections.values()) void connection.close()
     connections.clear()
   }, 'tool-aggregator cleanup')

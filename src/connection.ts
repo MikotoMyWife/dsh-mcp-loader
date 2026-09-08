@@ -4,13 +4,20 @@
  * The connection is created on first use (never at plugin load), shared by
  * every concurrent caller, and kept alive after `unload` so a re-load is
  * immediate. A transport-level failure drops the client so the next call
- * reconnects instead of failing forever.
+ * reconnects instead of failing forever. One user-visible operation (a loader
+ * load, a tool call, a startup probe) draws from a single retry budget of
+ * `reconnectAttempts + 1` connect+discovery attempts with bounded exponential
+ * backoff (`reconnectAttempts` / `reconnectBackoffMs`); an idle server can be
+ * soft-disconnected by the loader (`disconnect()`) and rebuilds on the next
+ * load. Retry sleeps are interrupted by `close()`/`disconnect()`, so a
+ * scheduled retry never spawns after teardown. A failed `tools/call` is never
+ * retried or replayed.
  */
 import { createHash } from 'node:crypto'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js'
+import { ErrorCode, McpError, ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js'
 import type { DiscoveredTool, ServerConfig } from './types.js'
 
 /** DeepSeek function-name contract: at most 64 characters. */
@@ -23,6 +30,31 @@ const HASH_LENGTH = 12
 export const DEFAULT_TOOL_CALL_TIMEOUT_MS = 60_000
 /** Default connection handshake deadline. */
 export const DEFAULT_CONNECT_TIMEOUT_MS = 30_000
+/** Default number of retries after a failed connect/discovery. */
+export const DEFAULT_RECONNECT_ATTEMPTS = 1
+/** Default base delay before the first retry, in milliseconds. */
+export const DEFAULT_RECONNECT_BACKOFF_MS = 500
+/** Backoff never exceeds this, whatever the exponent says. */
+export const MAX_RETRY_BACKOFF_MS = 30_000
+
+/**
+ * Whether a failed connect or discovery is worth retrying.
+ *
+ * Only transient establish/transport/timeout failures qualify: the MCP SDK
+ * maps a dead transport and an in-flight request timeout to
+ * `McpError(ConnectionClosed / RequestTimeout)`, while any other `McpError` is
+ * an answered protocol error a retry will not fix. Plain errors (spawn
+ * failures, our connect wrapper, handshake timeouts) are establish failures by
+ * nature and are retried. Slice 03 adds its deterministic discovery caps to the
+ * exclusion list here. A failed `tools/call` never reaches this predicate —
+ * {@link ServerConnection.callTool} invalidates and rethrows without replaying.
+ */
+export function isRetryable(error: unknown): boolean {
+  if (error instanceof McpError) {
+    return error.code === ErrorCode.ConnectionClosed || error.code === ErrorCode.RequestTimeout
+  }
+  return true
+}
 
 /**
  * Result schema that accepts any `tools/call` result shape.
@@ -97,6 +129,12 @@ export function validateServerConfig(name: string, config: ServerConfig): string
     && (!Number.isFinite(config.toolCallTimeoutMs) || config.toolCallTimeoutMs <= 0)) {
     problems.push('"toolCallTimeoutMs" must be a positive finite number')
   }
+  for (const field of ['reconnectAttempts', 'reconnectBackoffMs', 'idleDisconnectMs'] as const) {
+    const value = config[field]
+    if (value !== undefined && (!Number.isInteger(value) || value < 0)) {
+      problems.push(`"${field}" must be a non-negative integer`)
+    }
+  }
   return problems
 }
 
@@ -123,10 +161,18 @@ export class ServerConnection {
   #logger: Logger
   #connectTimeoutMs: number
   #toolCallTimeoutMs: number
+  #reconnectAttempts: number
+  #reconnectBackoffMs: number
   #client: Client | undefined
   #connecting: Promise<Client> | undefined
   #tools: DiscoveredTool[] | undefined
   #onListChanged: (() => void) | undefined
+  /** A client was dropped (failed call, disconnect) — the next connect is a rebuild. */
+  #dropped = false
+  /** Bumped by `close()`/`disconnect()` to invalidate in-flight retry loops. */
+  #retryEpoch = 0
+  /** The current retry backoff sleep, woken early by `#interruptRetry()`. */
+  #retrySleep: { timer: NodeJS.Timeout; wake: () => void } | undefined
   #closed = false
 
   constructor(name: string, config: ServerConfig, logger: Logger, connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS) {
@@ -135,21 +181,102 @@ export class ServerConnection {
     this.#logger = logger
     this.#connectTimeoutMs = connectTimeoutMs
     this.#toolCallTimeoutMs = config.toolCallTimeoutMs ?? DEFAULT_TOOL_CALL_TIMEOUT_MS
+    this.#reconnectAttempts = config.reconnectAttempts ?? DEFAULT_RECONNECT_ATTEMPTS
+    this.#reconnectBackoffMs = config.reconnectBackoffMs ?? DEFAULT_RECONNECT_BACKOFF_MS
   }
 
-  /** Connect on first use; concurrent callers share the one attempt. */
+  /**
+   * Connect on first use with the connection's retry budget; concurrent
+   * callers share the one in-flight attempt. Only the *establish* is retried —
+   * the tool-call path uses this, and the call itself is never retried.
+   */
   async client(): Promise<Client> {
+    return this.#retry((n) => this.#acquire(n))
+  }
+
+  /**
+   * Return the current client, or share one in-flight connect attempt. Never
+   * retries on its own: the caller's `#retry` loop owns the budget, so nested
+   * loops cannot multiply the `reconnectAttempts` allowance.
+   */
+  async #acquire(n: number): Promise<Client> {
     if (this.#closed) throw new Error(`MCP server "${this.name}" is closed`)
     if (this.#client !== undefined) return this.#client
     if (this.#connecting === undefined) {
-      this.#connecting = this.#connect().finally(() => {
+      this.#connecting = this.#connectOnce(n).finally(() => {
         this.#connecting = undefined
       })
     }
     return this.#connecting
   }
 
-  async #connect(): Promise<Client> {
+  /**
+   * Run `attempt` up to `reconnectAttempts + 1` times — one shared budget for
+   * whichever user-visible operation called it (a loader load, a tool call, a
+   * startup probe) — sleeping `reconnectBackoffMs × 2^n` between tries.
+   * Failures that {@link isRetryable} rejects as non-transient abort
+   * immediately; the last error is rethrown when the budget is exhausted.
+   *
+   * Every round starts and ends with a liveness check: once {@link close} or
+   * {@link disconnect} has run, a sleeping retry is woken and the loop exits
+   * without spawning again, so teardown and idle disconnect never leave a
+   * scheduled spawn behind.
+   */
+  async #retry<T>(attempt: (n: number) => Promise<T>): Promise<T> {
+    const tries = 1 + Math.max(0, this.#reconnectAttempts)
+    const epoch = this.#retryEpoch
+    let lastError: unknown
+    for (let n = 0; n < tries; n++) {
+      this.#throwIfRetrySuperseded(epoch)
+      try {
+        return await attempt(n)
+      } catch (error) {
+        lastError = error
+        if (!isRetryable(error) || n + 1 >= tries) break
+        this.#throwIfRetrySuperseded(epoch)
+        await this.#backoffSleep(Math.min(this.#reconnectBackoffMs * 2 ** n, MAX_RETRY_BACKOFF_MS))
+      }
+    }
+    throw lastError
+  }
+
+  /** Throw when close/disconnect superseded this retry loop at a round boundary. */
+  #throwIfRetrySuperseded(epoch: number): void {
+    if (this.#closed || epoch !== this.#retryEpoch) {
+      throw new Error(`MCP server "${this.name}" ${this.#closed ? 'is closed' : 'was disconnected'}; retries cancelled`)
+    }
+  }
+
+  /** Backoff sleep that {@link #interruptRetry} wakes early. */
+  #backoffSleep(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const wake = () => resolve()
+      const timer = setTimeout(() => {
+        if (this.#retrySleep?.wake === wake) this.#retrySleep = undefined
+        resolve()
+      }, ms)
+      this.#retrySleep = { timer, wake }
+    })
+  }
+
+  /** Wake a sleeping retry and invalidate every in-flight retry loop. */
+  #interruptRetry(): void {
+    this.#retryEpoch += 1
+    const sleep = this.#retrySleep
+    this.#retrySleep = undefined
+    if (sleep !== undefined) {
+      clearTimeout(sleep.timer)
+      sleep.wake()
+    }
+  }
+
+  /**
+   * Establish one connection. A failed attempt closes its own transport, so it
+   * is never reusable; retrying here is safe because no request has been sent
+   * yet — tools/call is never replayed anywhere. `n` is the attempt ordinal of
+   * the enclosing retry loop, used only for the log line.
+   */
+  async #connectOnce(n: number): Promise<Client> {
     const client = new Client({ name: 'dsh-tool-aggregator', version: '0.5.0' })
     client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
       // The cached list is stale; whoever loaded this server re-syncs.
@@ -163,7 +290,13 @@ export class ServerConnection {
       throw new Error(`could not connect to MCP server "${this.name}": ${messageOf(error)}`)
     }
     this.#client = client
-    this.#logger.info(`[tool-aggregator] connected to MCP server "${this.name}"`)
+    const rebuilt = this.#dropped || n > 0
+    this.#dropped = false
+    this.#logger.info(
+      rebuilt
+        ? `[tool-aggregator] MCP server "${this.name}" client rebuilt (attempt ${n + 1})`
+        : `[tool-aggregator] connected to MCP server "${this.name}"`,
+    )
     return client
   }
 
@@ -185,10 +318,38 @@ export class ServerConnection {
   /**
    * The server's tool list, cached until a `list_changed` notification or a
    * forced refresh. Connects on first call.
+   *
+   * One retry unit is a full connect + discovery, and the operation draws from
+   * the single `reconnectAttempts + 1` budget — a load, probe or resync never
+   * multiplies its allowance across an inner connect retry. A mid-discovery
+   * failure drops the client (it may be half-dead), so the next attempt — and
+   * every later call — starts from a fresh connection.
    */
   async listTools(force = false): Promise<DiscoveredTool[]> {
     if (this.#tools !== undefined && !force) return this.#tools
-    const client = await this.client()
+    return this.#retry(async (n) => {
+      const client = await this.#acquire(n)
+      try {
+        const discovered = await this.#discover(client)
+        this.#tools = discovered
+        return discovered
+      } catch (error) {
+        // A failure after a successful connect leaves the client in an unknown
+        // state. Drop it so the retry — and every later call — reconnects;
+        // deterministic failures still surface (after invalidation) when the
+        // retry budget is exhausted or the error is non-transient.
+        this.#tools = undefined
+        if (isRetryable(error)) {
+          this.#client = undefined
+          this.#dropped = true
+          await client.close().catch(() => {})
+        }
+        throw error
+      }
+    })
+  }
+
+  async #discover(client: Client): Promise<DiscoveredTool[]> {
     const discovered: DiscoveredTool[] = []
     const seen = new Set<string>()
     let cursor: string | undefined
@@ -209,7 +370,6 @@ export class ServerConnection {
       }
       cursor = page.nextCursor
     } while (cursor !== undefined)
-    this.#tools = discovered
     return discovered
   }
 
@@ -232,9 +392,11 @@ export class ServerConnection {
     } catch (error) {
       if (!signal.aborted) {
         // Transport-level failure: the client is unusable, so drop it and let
-        // the next call reconnect rather than fail forever.
+        // the next call reconnect rather than fail forever. The call itself is
+        // never replayed — its side effects are unknown.
         this.#client = undefined
         this.#tools = undefined
+        this.#dropped = true
         await client.close().catch(() => {})
         this.#logger.warn(`[tool-aggregator] MCP server "${this.name}" dropped after a failed call: ${messageOf(error)}`)
       }
@@ -252,9 +414,43 @@ export class ServerConnection {
     return { connected: this.#client !== undefined, discovered: this.#tools?.length }
   }
 
+  /**
+   * Soft disconnect: close the current client (and any in-flight connect) and
+   * drop the cached state, but keep this connection reusable.
+   *
+   * Unlike {@link close}, this does not set the closed flag and keeps the
+   * list_changed listener, so the next `client()` / `listTools()` reconnects
+   * lazily — used by the idle-disconnect timer in the loader, which must be
+   * able to rebuild the connection on the next load.
+   */
+  async disconnect(): Promise<void> {
+    this.#dropped = true
+    // Cancel any scheduled retry first: a sleeping retry must not wake up and
+    // spawn a fresh child that undoes this disconnect.
+    this.#interruptRetry()
+    const connecting = this.#connecting
+    this.#connecting = undefined
+    if (connecting !== undefined) {
+      try {
+        // Settle the in-flight attempt so it cannot leave a client behind; a
+        // failed attempt already closed its own transport.
+        await connecting
+      } catch {
+        // Ignore: the attempt's error is not this caller's to report.
+      }
+    }
+    const client = this.#client
+    this.#client = undefined
+    this.#tools = undefined
+    if (client !== undefined) await client.close().catch(() => {})
+  }
+
   async close(): Promise<void> {
     this.#closed = true
     this.#onListChanged = undefined
+    // Interrupt any retry that is sleeping between attempts so plugin teardown
+    // never triggers another spawn.
+    this.#interruptRetry()
     const client = this.#client
     this.#client = undefined
     this.#tools = undefined

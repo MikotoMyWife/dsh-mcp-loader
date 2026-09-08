@@ -14,7 +14,7 @@
  * Coverage table
  * | # | Action                                        | Expected                                                   |
  * |---|-----------------------------------------------|------------------------------------------------------------|
- * | 1 | mount with a 4-tool server                    | only its loader is visible, its real tools are hidden      |
+ * | 1 | mount with a 6-tool server                    | only its loader is visible, its real tools are hidden      |
  * | 2 | loader description                            | server description + loader hint                           |
  * | 3 | mount with a 1-tool server (auto)             | that tool is visible, no loader for it                     |
  * | 4 | call the eagerly registered tool              | works                                                      |
@@ -26,15 +26,23 @@
  * | 10| call the loader twice, then a third time             | hides on the second call, reveals again on the third      |
  * | 11| per-agent restrict() on a revealed tool       | hides it in that scope only                                |
  * | 12| assembled model request                       | lacks the tool before the loader call, has it after        |
- * | 13| mode: eager (4-tool server)                   | tools visible at mount, no loader                          |
+ * | 13| mode: eager (6-tool server)                   | tools visible at mount, no loader                          |
  * | 14| mode: lazy (1-tool server)                    | loader present, tool hidden until the loader is called     |
  * | 15| tool whose structured content breaks its own output schema | still callable (live inkstone `search` regression) |
  * | 16| call the loader a second time                    | hides the tools; a third call reveals them again         |
  * | 17| hiddenTools masks a loaded server                 | masked for that agent, still global for everyone else    |
  * | 18| toolDescriptions + parameter cap                  | rewritten description and truncated parameter text       |
  * | 19| unknown descriptionPreset                         | plugin stays unmounted (fail fast)                       |
+ * | 20| first connect crashes once (`flaky`)               | retried; load succeeds after exactly 2 child starts      |
+ * | 21| a tool call crashes the server (`die`)             | error surfaced, call sent exactly once (never replayed); the next call reconnects to a fresh child |
+ * | 22| `reconnectAttempts: 0` (`noretry`)                 | single attempt, v0.5.0 behavior: load fails, no tools    |
+ * | 22b| invalid retry/idle config (negative / fractional)  | plugin stays unmounted, error names the field + server   |
+ * | 23| `idleDisconnectMs: 300` (`idle`)                   | unload → connection closed (child exit marker) → reload rebuilds with a fresh child |
+ * | 24| rebuild & visibility-transfer logs                 | `client rebuilt (attempt N)` and `loaded N tool(s)` lines observable via the logger exporter |
  */
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -69,6 +77,21 @@ const FORCED_TOOLS = [
 ]
 const HINT = "Call to load this MCP server's tools; call again to hide them."
 
+// Per-run scratch dir for the fault-injection markers and observability logs;
+// removed when the suite exits.
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dshmcp-e2e-'))
+const file = (name) => path.join(TMP, name)
+const readLines = (name) => {
+  try {
+    return fs.readFileSync(file(name), 'utf8').split('\n').map((line) => line.trim()).filter(Boolean)
+  } catch {
+    return [] // not created yet
+  }
+}
+const countLines = (name, line) => readLines(name).filter((entry) => entry === line).length
+const waitForLines = (name, predicate, label, timeoutMs = 15_000) =>
+  waitFor(() => predicate(readLines(name)), label, timeoutMs)
+
 const ctx = new Context()
 ctx.plugin(SystemPrompt)
 ctx.plugin(ToolRuntime, {})
@@ -84,6 +107,19 @@ async function waitFor(predicate, label, timeoutMs = 20_000) {
 }
 
 await waitFor(() => ctx.tools !== undefined, 'the tools service to come up')
+
+// Capture every log line of the shared context through Cordis' logger exporter
+// so the new lifecycle logs (#24) are asserted on the real logging surface.
+const logLines = []
+ctx.logger.exporter({
+  levels: { default: 99 },
+  export(message) {
+    for (const arg of message.args ?? []) {
+      logLines.push(arg instanceof Error ? arg.message : String(arg))
+    }
+  },
+})
+
 ctx.plugin(plugin, {
   servers: {
     fixture: {
@@ -128,6 +164,40 @@ ctx.plugin(plugin, {
       maxParameterDescriptionChars: 20,
       command: process.execPath,
       args: [FIXTURE],
+    },
+    flaky: {
+      description: 'Flaky fixture server whose first connection attempt crashes',
+      mode: 'lazy',
+      command: process.execPath,
+      args: [FIXTURE],
+      env: {
+        ECHO_FAIL_FIRST_CONNECT: '1',
+        ECHO_MARKER: file('flaky.marker'),
+        ECHO_LOG: file('flaky.log'),
+      },
+    },
+    noretry: {
+      description: 'Fixture server with reconnect disabled (v0.5.0 semantics)',
+      mode: 'lazy',
+      reconnectAttempts: 0,
+      command: process.execPath,
+      args: [FIXTURE],
+      env: {
+        ECHO_FAIL_FIRST_CONNECT: '1',
+        ECHO_MARKER: file('noretry.marker'),
+        ECHO_LOG: file('noretry.log'),
+      },
+    },
+    idle: {
+      description: 'Idle-disconnect fixture server',
+      mode: 'lazy',
+      idleDisconnectMs: 300,
+      command: process.execPath,
+      args: [SINGLE],
+      env: {
+        ECHO_LOG: file('idle.log'),
+        ECHO_EXIT_MARKER: file('idle.closed'),
+      },
     },
   },
 })
@@ -348,6 +418,130 @@ await check(19, 'an unknown description preset keeps the plugin unmounted', asyn
   await isolated.fiber.dispose()
 })
 
+await check(20, 'a first-connect crash is retried with backoff and the load succeeds', async () => {
+  // `flaky` runs the echo fixture whose very first child process exits on
+  // arrival (see ECHO_FAIL_FIRST_CONNECT); the default reconnectAttempts: 1
+  // must spawn a second, healthy child and complete the load.
+  const result = await call('mcp_flaky', {})
+  assert.equal(result.isError, false, textOf(result))
+  assert.ok(visible().includes('mcp__flaky__echo'), 'flaky tools missing after the retried load')
+  // Exactly two child processes served this load: the injected crash + the retry.
+  assert.equal(countLines('flaky.log', 'start'), 2, `unexpected starts: ${JSON.stringify(readLines('flaky.log'))}`)
+})
+
+await check(21, 'a mid-call crash surfaces once, is never replayed, and the next call reconnects', async () => {
+  // `die` makes the fixture process exit mid-request. The call must come back
+  // as an error and must have reached the server exactly once.
+  const crashed = await call('mcp__flaky__die', {})
+  assert.equal(crashed.isError, true, textOf(crashed))
+  assert.equal(countLines('flaky.log', 'die'), 1, 'the crashed call must not be replayed')
+  // The very next call auto-reconnects to a fresh child and succeeds.
+  const again = await call('mcp__flaky__echo', { text: 'again' })
+  assert.equal(again.isError, false, textOf(again))
+  assert.equal(textOf(again), 'echo:again')
+  await waitForLines(
+    'flaky.log',
+    (lines) => lines.filter((entry) => entry === 'start').length === 3,
+    'the reconnect to spawn a fresh child process',
+  )
+})
+
+await check(22, 'reconnectAttempts: 0 keeps the v0.5.0 single-attempt behavior', async () => {
+  // `noretry` has the same crash-on-first-connect fixture but attempts=0: no
+  // retry, the load fails, and only the crashed child is ever spawned.
+  const result = await call('mcp_noretry', {})
+  assert.equal(result.isError, true, textOf(result))
+  assert.match(textOf(result), /could not connect to MCP server "noretry"/)
+  assert.ok(!visible().includes('mcp__noretry__echo'), 'tools were registered despite the failed load')
+  assert.equal(countLines('noretry.log', 'start'), 1, 'attempts=0 must not respawn the server')
+})
+
+await check('22b', 'an invalid retry/idle config keeps the plugin unmounted and names the field', async () => {
+  const expectUnmounted = async (serverName, serverConfig, needle) => {
+    const isolated = new Context()
+    isolated.plugin(SystemPrompt)
+    isolated.plugin(ToolRuntime, {})
+    await waitFor(() => isolated.tools !== undefined, 'the isolated tools service')
+    const lines = []
+    isolated.logger.exporter({
+      levels: { default: 99 },
+      export(message) {
+        for (const arg of message.args ?? []) {
+          lines.push(arg instanceof Error ? arg.message : String(arg))
+        }
+      },
+    })
+    isolated.plugin(plugin, { servers: { [serverName]: serverConfig } })
+    await waitFor(() => lines.some((line) => line.includes(needle) && line.includes(`"${serverName}"`)),
+      `the mount error naming ${needle}`)
+    assert.ok(
+      !isolated.tools.schemas().some((entry) => entry.name.startsWith('mcp_')),
+      `a loader was registered despite ${needle}`,
+    )
+    await isolated.fiber.dispose()
+  }
+  // Negative attempt count.
+  await expectUnmounted(
+    'badneg',
+    { reconnectAttempts: -1, command: process.execPath, args: [SINGLE] },
+    '"reconnectAttempts" must be a non-negative integer',
+  )
+  // Fractional idle timeout.
+  await expectUnmounted(
+    'badfrac',
+    { idleDisconnectMs: 0.5, command: process.execPath, args: [SINGLE] },
+    '"idleDisconnectMs" must be a non-negative integer',
+  )
+})
+
+await check(23, 'idleDisconnectMs closes an unloaded connection; a later load rebuilds it', async () => {
+  const first = await call('mcp_idle', {})
+  assert.equal(textOf(first), 'ok')
+  assert.ok(visible().includes('mcp__idle__ping'), 'ping missing after the load')
+  const hidden = await call('mcp_idle', {})
+  assert.match(textOf(hidden), /^ok \(\d+ tool\(s\) hidden\)$/)
+  assert.ok(!visible().includes('mcp__idle__ping'), 'ping still visible after the unload')
+  // The idle timer must close the (still warm) connection: the child exits and
+  // writes its exit marker — proving unload itself did not close it (otherwise
+  // the marker would already exist) and the idle disconnect did.
+  assert.equal(countLines('idle.closed', 'closed'), 0, 'unload must not close the connection')
+  await waitForLines('idle.closed', (lines) => lines.includes('closed'), 'the idle-disconnected child to exit')
+  // Reload rebuilds the connection with a fresh child and the tool works.
+  const again = await call('mcp_idle', {})
+  assert.equal(textOf(again), 'ok')
+  assert.ok(visible().includes('mcp__idle__ping'), 'ping missing after the rebuild')
+  const pong = await call('mcp__idle__ping', {})
+  assert.equal(pong.isError, false, textOf(pong))
+  assert.equal(textOf(pong), 'pong')
+  assert.equal(countLines('idle.log', 'start'), 2, 'the rebuild must spawn a fresh child process')
+})
+
+await check(24, 'rebuilds and visibility transfers are logged with counts (never silent)', async () => {
+  // The checks above produce deterministic lifecycle lines on this shared
+  // context; assert they are observable through the Cordis logger exporter:
+  //   - #20: first-connect crash recovered on attempt 2 of "flaky";
+  //   - #21: post-crash reconnect on attempt 1 of "flaky";
+  //   - #20 load: a counted "loaded N tool(s) from \"flaky\"" line;
+  //   - #23: idle disconnect event + rebuilt connection of "idle".
+  const rebuilt = logLines.filter((line) => line.includes('client rebuilt'))
+  assert.ok(
+    rebuilt.some((line) => line.includes('"flaky"') && line.includes('(attempt 2)')),
+    `missing the attempt-2 rebuild log: ${JSON.stringify(rebuilt)}`,
+  )
+  assert.ok(
+    rebuilt.some((line) => line.includes('"flaky"') && line.includes('(attempt 1)')),
+    `missing the attempt-1 rebuild log: ${JSON.stringify(rebuilt)}`,
+  )
+  assert.ok(
+    logLines.some((line) => /loaded \d+ tool\(s\) from "flaky"/.test(line)),
+    `missing the counted load log: ${JSON.stringify(logLines.slice(-20))}`,
+  )
+  assert.ok(
+    logLines.some((line) => line.includes('"idle" disconnected after idle')),
+    'missing the counted idle-disconnect log',
+  )
+})
+
 const failures = results.filter((entry) => entry.status === 'FAIL')
 for (const entry of results) {
   console.log(`${entry.status}  #${entry.id}  ${entry.title}${entry.detail ? `\n      ${entry.detail}` : ''}`)
@@ -356,4 +550,5 @@ console.log(`\n${results.length - failures.length}/${results.length} checks pass
 
 // Tear the harness down so the plugin's cleanup closes the MCP subprocesses.
 await ctx.fiber.dispose()
+fs.rmSync(TMP, { recursive: true, force: true })
 process.exit(failures.length === 0 ? 0 : 1)
