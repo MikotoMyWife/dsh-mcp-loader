@@ -26,12 +26,36 @@ export interface ServerConfig {
   /** Model-facing loader tool name; defaults to `mcp_<serverName>`. */
   loaderName?: string
   /**
-   * Tools to hide from every agent once this server is loaded (merged from the
-   * retired `inkstone-tool-hide` plugin). Each entry may be a raw MCP tool name
-   * (`organize_note`) or a public one (`mcp__inkstone__organize_note`); the
-   * plugin applies a per-agent `ctx.tools.restrict({ deny })`.
+   * Rules naming tools to hide from every agent once this server is loaded
+   * (merged from the retired `inkstone-tool-hide` plugin; a per-agent
+   * `ctx.tools.restrict({ deny })`, so the tools stay globally registered).
+   *
+   * Each entry is a rule matched against the discovered tool set at load time:
+   * - a raw name rule (`organize_note`, `note_*`) is anchored (`^…$`) and
+   *   matched against the MCP tool's raw name;
+   * - a public name rule (`mcp__inkstone__organize_note`,
+   *   `mcp__inkstone__get_*`) is anchored and matched against the tool's
+   *   public name (`mcp__<server>__<raw>`);
+   * - `*` matches any run of characters (including none), `?` exactly one.
+   *
+   * v0.5.0 exact raw/full names keep their behavior unchanged; the matched
+   * public names are deduplicated into one deny list. The server's own loader
+   * tool can never be masked: a rule textually equal to the loader name fails
+   * plugin mount, and a glob that would cover the loader name is dropped from
+   * the deny list with a one-time warning at load.
    */
   hiddenTools?: string[]
+  /**
+   * Rules naming tools that are never registered (registration axis, unlike
+   * `hiddenTools` which is a per-agent visibility mask). Matched tools are
+   * dropped from the discovered set before registration, so they count toward
+   * no loaded-tool total, appear in no loader text, and are invisible to every
+   * agent. Same rule syntax as {@link ServerConfig.hiddenTools}. The loader
+   * tool is never a discovered tool, so `disabledTools` cannot disable a
+   * server's own loader; an exact rule textually equal to the loader name
+   * fails plugin mount anyway.
+   */
+  disabledTools?: string[]
   /** Replace individual tool descriptions, keyed by raw MCP tool name. */
   toolDescriptions?: Record<string, string>
   /**

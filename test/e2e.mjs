@@ -39,6 +39,11 @@
  * | 22b| invalid retry/idle config (negative / fractional)  | plugin stays unmounted, error names the field + server   |
  * | 23| `idleDisconnectMs: 300` (`idle`)                   | unload → connection closed (child exit marker) → reload rebuilds with a fresh child |
  * | 24| rebuild & visibility-transfer logs                 | `client rebuilt (attempt N)` and `loaded N tool(s)` lines observable via the logger exporter |
+ * | 25| hiddenTools glob (`e*` / `mcp__s__*`)                 | matched tools denied per agent after load; other tools visible and callable |
+ * | 26| exact-name rules (raw and `mcp__s__t`)                | deny exactly the named tool, as in v0.5.0 (#17 semantics unchanged) |
+ * | 27| disabledTools (`suppressed`)                          | tool never registered: absent from assemble, unknown to execute, "loaded 0 tool(s)" log |
+ * | 28| disabledTools all tools of an auto server (`dead`)    | probe disposes the loader; no tools; log names the disabledTools count |
+ * | 29| lockout protection                                   | static loader-name rule keeps the plugin unmounted; a glob covering the loader warns once and never hides it |
  */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -198,6 +203,48 @@ ctx.plugin(plugin, {
         ECHO_LOG: file('idle.log'),
         ECHO_EXIT_MARKER: file('idle.closed'),
       },
+    },
+    globbed: {
+      description: 'Server hiding every tool matching a raw glob',
+      mode: 'lazy',
+      hiddenTools: ['e*'],
+      command: process.execPath,
+      args: [FIXTURE],
+    },
+    globfull: {
+      description: 'Server hiding every tool matching a public-name glob',
+      mode: 'lazy',
+      hiddenTools: ['mcp__globfull__*'],
+      command: process.execPath,
+      args: [FIXTURE],
+    },
+    exactfull: {
+      description: 'Server hiding one tool by its exact public name',
+      mode: 'lazy',
+      hiddenTools: ['mcp__exactfull__add'],
+      command: process.execPath,
+      args: [FIXTURE],
+    },
+    suppressed: {
+      description: 'Single-tool server whose only tool is disabled',
+      mode: 'lazy',
+      disabledTools: ['ping'],
+      command: process.execPath,
+      args: [SINGLE],
+    },
+    dead: {
+      description: 'Auto-classified single-tool server whose only tool is disabled',
+      mode: 'auto',
+      disabledTools: ['ping'],
+      command: process.execPath,
+      args: [SINGLE],
+    },
+    lockwild: {
+      description: 'Server whose hiddenTools glob also covers its own loader name',
+      mode: 'lazy',
+      hiddenTools: ['ping', 'mcp_lockwild*'],
+      command: process.execPath,
+      args: [SINGLE],
     },
   },
 })
@@ -540,6 +587,166 @@ await check(24, 'rebuilds and visibility transfers are logged with counts (never
     logLines.some((line) => line.includes('"idle" disconnected after idle')),
     'missing the counted idle-disconnect log',
   )
+})
+
+await check(25, 'hiddenTools globs deny matched tools per agent and leave others callable', async () => {
+  // `globbed` (raw glob `e*`) hides only `echo`; `globfull` (public glob
+  // `mcp__globfull__*`) hides every tool of that server. Both masks are per
+  // agent, mirroring the #17 scope pattern.
+  const agentKey = { id: 'glob-scope' }
+  let scope
+  ctx.plugin({
+    name: 'test-glob-scope',
+    inject: ['tools'],
+    apply(mintCtx) {
+      scope = createScope(mintCtx, agentKey)
+    },
+  })
+  await waitFor(() => scope !== undefined, 'the glob test scope')
+  try {
+    const agent = { ctx: scope.ctx }
+    const raw = await call('mcp_globbed', {}, agent)
+    assert.equal(textOf(raw), 'ok')
+    const full = await call('mcp_globfull', {}, agent)
+    assert.equal(textOf(full), 'ok')
+    assert.ok(visible().includes('mcp__globbed__echo'), 'echo must stay globally registered')
+    assert.ok(visible().includes('mcp__globfull__add'), 'globfull tools must stay globally registered')
+    const scoped = visible(agentKey)
+    assert.ok(!scoped.includes('mcp__globbed__echo'), `raw glob did not deny echo: ${JSON.stringify(scoped)}`)
+    assert.ok(scoped.includes('mcp__globbed__add'), 'raw glob denied a non-matching tool')
+    for (const tool of ['add', 'echo', 'fail', 'structured']) {
+      assert.ok(!scoped.includes(`mcp__globfull__${tool}`), `public glob leaked ${tool} to the agent`)
+    }
+    assert.ok(scoped.includes('mcp_globfull'), 'the loader itself must stay visible to the agent')
+    // The raw-glob non-match stays callable through the real registry.
+    const added = await call('mcp__globbed__add', { a: 2, b: 3 })
+    assert.equal(added.isError, false, textOf(added))
+    assert.equal(textOf(added), '5')
+  } finally {
+    await scope.dispose()
+  }
+})
+
+await check(26, 'exact hiddenTools names deny exactly the named tool (v0.5.0 semantics)', async () => {
+  // `exactfull` uses the public exact name `mcp__exactfull__add`: deny is that
+  // precise set — `echo` must stay visible and callable for the same agent
+  // (raw exact names are the #17 `masked` regression, still green above).
+  const agentKey = { id: 'exact-scope' }
+  let scope
+  ctx.plugin({
+    name: 'test-exact-scope',
+    inject: ['tools'],
+    apply(mintCtx) {
+      scope = createScope(mintCtx, agentKey)
+    },
+  })
+  await waitFor(() => scope !== undefined, 'the exact test scope')
+  try {
+    const agent = { ctx: scope.ctx }
+    const result = await call('mcp_exactfull', {}, agent)
+    assert.equal(textOf(result), 'ok')
+    assert.ok(visible().includes('mcp__exactfull__add'), 'the named tool must stay globally registered')
+    const scoped = visible(agentKey)
+    assert.ok(!scoped.includes('mcp__exactfull__add'), `exact full name leaked: ${JSON.stringify(scoped)}`)
+    assert.ok(scoped.includes('mcp__exactfull__echo'), 'exact rule denied a tool it did not name')
+    const echoed = await call('mcp__exactfull__echo', { text: 'hi' })
+    assert.equal(echoed.isError, false, textOf(echoed))
+    assert.equal(textOf(echoed), 'echo:hi')
+  } finally {
+    await scope.dispose()
+  }
+})
+
+await check(27, 'disabledTools keeps the tool out of the registry entirely', async () => {
+  // `suppressed` is a lazy single-tool server whose only tool is disabled:
+  // loading it registers nothing.
+  const result = await call('mcp_suppressed', {})
+  assert.equal(result.isError, false, textOf(result))
+  assert.ok(!visible().includes('mcp__suppressed__ping'), 'a disabled tool was registered')
+  const assembly = await ctx.systemPrompt.assemble()
+  const names = assembly.tools.map((tool) => tool.name)
+  assert.ok(!names.includes('mcp__suppressed__ping'), `disabled tool leaked into the request: ${names.join(',')}`)
+  const missing = await call('mcp__suppressed__ping', {})
+  assert.equal(missing.isError, true, 'a disabled tool must not be callable')
+  assert.match(textOf(missing), /unknown tool/, `unexpected text: ${textOf(missing)}`)
+  assert.ok(
+    logLines.some((line) => line.includes('loaded 0 tool(s) from "suppressed"')),
+    `missing the filtered load log: ${JSON.stringify(logLines.slice(-20))}`,
+  )
+})
+
+await check(28, 'an auto server whose every tool is disabled ends up with no loader', async () => {
+  // `dead` (auto, single tool, disabled): the startup probe must classify it
+  // as exposing no usable tools, dispose its loader, and log the count.
+  await waitFor(
+    () => logLines.some((line) => line.includes('"dead"') && line.includes('suppressed by disabledTools')),
+    'the dead-server probe log',
+  )
+  const names = visible()
+  assert.ok(!names.includes('mcp_dead'), 'a loader was kept for a fully disabled auto server')
+  assert.ok(!names.includes('mcp__dead__ping'), 'a tool of the fully disabled server was registered')
+})
+
+await check(29, 'a rule naming its own loader keeps the plugin unmounted or warns once', async () => {
+  // Static lockout: `hiddenTools` equal to the loader name is rejected at
+  // mount, in an isolated context so the shared one is untouched.
+  const staticCtx = new Context()
+  staticCtx.plugin(SystemPrompt)
+  staticCtx.plugin(ToolRuntime, {})
+  await waitFor(() => staticCtx.tools !== undefined, 'the isolated tools service')
+  const staticLines = []
+  staticCtx.logger.exporter({
+    levels: { default: 99 },
+    export(message) {
+      for (const arg of message.args ?? []) {
+        staticLines.push(arg instanceof Error ? arg.message : String(arg))
+      }
+    },
+  })
+  staticCtx.plugin(plugin, {
+    servers: {
+      lockbad: { hiddenTools: ['mcp_lockbad'], command: process.execPath, args: [SINGLE] },
+    },
+  })
+  await waitFor(
+    () => staticLines.some((line) => line.includes('"lockbad"') && line.includes('loader')),
+    'the static lockout error',
+  )
+  assert.ok(
+    !staticCtx.tools.schemas().some((entry) => entry.name.startsWith('mcp_')),
+    'a loader was registered despite the loader-name rule',
+  )
+  await staticCtx.fiber.dispose()
+  // Wildcard lockout: `lockwild` glob `mcp_lockwild*` covers its own loader
+  // name `mcp_lockwild`. The loader must stay visible and the removal warned
+  // once; the exact `ping` rule still denies the tool per agent.
+  const agentKey = { id: 'lock-scope' }
+  let scope
+  ctx.plugin({
+    name: 'test-lock-scope',
+    inject: ['tools'],
+    apply(mintCtx) {
+      scope = createScope(mintCtx, agentKey)
+    },
+  })
+  await waitFor(() => scope !== undefined, 'the lockout test scope')
+  try {
+    const agent = { ctx: scope.ctx }
+    const result = await call('mcp_lockwild', {}, agent)
+    assert.equal(textOf(result), 'ok')
+    await waitFor(
+      () => logLines.some((line) => line.includes('"lockwild"') && line.includes('loader') && line.includes('kept visible')),
+      'the loader-name warn',
+    )
+    const scoped = visible(agentKey)
+    assert.ok(scoped.includes('mcp_lockwild'), `the loader must stay visible: ${JSON.stringify(scoped)}`)
+    assert.ok(!scoped.includes('mcp__lockwild__ping'), 'the tool rule stopped applying')
+    const ping = await call('mcp__lockwild__ping', {})
+    assert.equal(ping.isError, false, textOf(ping))
+    assert.equal(textOf(ping), 'pong')
+  } finally {
+    await scope.dispose()
+  }
 })
 
 const failures = results.filter((entry) => entry.status === 'FAIL')

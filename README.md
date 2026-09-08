@@ -37,7 +37,12 @@ at startup and stay resident without a loader.
 - **Per-server loader toggle** — load, hide, reload, with a visible result message (`ok`, `ok (N tool(s) hidden)`).
 - **Modes** — `auto` (probe once at startup), `lazy` (always behind a loader, never probed), `eager` (always resident, no loader).
 - **`hiddenTools`** — mask specific tools per agent after a server loads (`restrict({ deny })`), for every existing
-  agent and for agents created later; masks are per-agent visibility only, the tools stay globally registered.
+  agent and for agents created later. Entries are rules — exact raw names (`ping`), exact public names
+  (`mcp__solo__ping`) or globs (`e*`, `mcp__solo__*`, `?` matches one char) — expanded over the tools the server
+  actually exposes at load time. Masks are per-agent visibility only; the tools stay globally registered.
+- **`disabledTools`** — never register matched tools at all (registration axis, global): the tools are dropped
+  before registration, count toward no loaded-tool total, and are invisible to every agent. Same rule syntax as
+  `hiddenTools`. The loader tool is never affected (it is not a discovered MCP tool).
 - **Description engineering** — per-server `description`, `descriptionPreset`, per-tool `toolDescriptions`
   overrides, and parameter-description truncation (`maxParameterDescriptionChars`), so the model-facing text
   says what the tool does and when to use it.
@@ -83,7 +88,8 @@ Then register the plugin in your profile (id `mcp-loader`, package `dsh-mcp-load
 | `servers.<n>.description` | — | Loader description body: what it can do + when to use it |
 | `servers.<n>.mode` | `auto` | `auto` / `lazy` (always loader) / `eager` (always resident) |
 | `servers.<n>.loaderName` | `mcp_<server>` | Model-visible loader name |
-| `servers.<n>.hiddenTools` | — | Tool names (raw or `mcp__s__t`) masked per agent after load |
+| `servers.<n>.hiddenTools` | — | Tool rules (raw/public exact names or globs) masked per agent after load; glob `*` matches any run, `?` one char |
+| `servers.<n>.disabledTools` | — | Tool rules never registered (same syntax as `hiddenTools`) |
 | `servers.<n>.toolDescriptions` | — | Per-tool description overrides |
 | `servers.<n>.descriptionPreset` | — | Built-in description tables (`desktop-touch`) |
 | `servers.<n>.maxParameterDescriptionChars` | `0` | Truncate parameter descriptions (preset may imply one) |
@@ -99,9 +105,60 @@ Then register the plugin in your profile (id `mcp-loader`, package `dsh-mcp-load
 | `loaderHint` | `Call to load this MCP server's tools; call again to hide them.` | Appended to every loader description |
 | `probeAtStartup` | `true` | Probe `auto`/`eager` servers at startup (`lazy` never probed) |
 
+## Hiding vs disabling tools
+
+Two options remove tools from the model's sight; they act on different axes and must not be conflated.
+Both accept the same rule syntax:
+
+- an **exact raw name**, e.g. `ping` — matches `^ping$` against the MCP tool's raw name;
+- an **exact public name**, e.g. `mcp__inkstone__search` — matches against the public name `mcp__<server>__<tool>`;
+- a **glob** in either spelling, e.g. `note_*`, `search_?`, `mcp__inkstone__*` — `*` matches any run of characters
+  (including none), `?` matches exactly one; the pattern is anchored (`^…$`).
+
+Rules are expanded over the tool list the server actually exposes when it loads (and re-expanded on re-sync), so a
+pattern only ever hides tools that exist, and multiple rules hitting the same tool deny it once. Exact names keep
+their v0.5.0 behavior unchanged.
+
+| Configuration | Mechanism | Scope | Takes effect |
+|---|---|---|---|
+| Loader called twice / `mode: lazy` never loaded | Registry removal (unload / not registered) | All agents | On call |
+| `disabledTools` | Registry removal — matched tools are filtered out **before** registration | All agents (globally banned) | On load / re-sync |
+| `hiddenTools` | Visibility removal — `restrict({ deny })` per agent | Each agent (per-agent mask) | After load, applied per agent |
+
+The three axes are independent: being in the registry ≠ being visible ≠ being callable. `disabledTools` is the
+registry axis (a tool that is never registered is unreachable), `hiddenTools` stays the visibility axis (tools stay
+globally registered, only masked per agent). There is deliberately **no execution axis**: this plugin adds no
+`pre-execute` deny listener — a tool that is registered and visible is callable. (An execution-axis deny would only
+be worth adding if a future mode keeps tools registered while projecting them away.)
+
+**Lockout protection.** A server's own loader tool can never be hidden or disabled by its own rules:
+
+- an exact rule textually equal to the loader name (`loaderName` or the default `mcp_<server>`) is rejected at
+  plugin mount with a message naming the server and the loader;
+- a glob that would also cover the loader name is dropped from the deny mask and a one-time warning is logged at
+  load; the loader stays visible so the server can always be toggled again.
+
+`disabledTools` cannot disable a loader at all: loaders are plugin-registered tools, never discovered MCP tools.
+
+**When everything is disabled.** A server whose every discovered tool matches `disabledTools` is treated as an
+empty server: a loader call returns `ok` and registers nothing (logged as `loaded 0 tool(s) ... (N suppressed by
+disabledTools)`), and under `auto`/`eager` the startup probe removes the loader entirely — the server then only
+returns if you edit its configuration and restart (keep `mode: lazy` if you may want to re-enable tools without a
+restart).
+
+**Interaction with the discovery caps (slice 03).** The per-server tool-count caps live in the connection layer and
+count *raw discovered* tools, while `disabledTools` filters later, in the loader layer. A server that reports more
+raw tools than the cap will therefore fail discovery before `disabledTools` can help — that is intentional: the
+cap protects against an out-of-control server's own catalogue, not against your configuration of it. Raise the cap
+or drop the server if you need to ban most of a huge catalogue.
+
 ## Known limitations
 
 - Granularity is per server, not per tool (one loader per server).
+- Tool rules are expanded when a generation loads and re-expanded when it re-syncs, so a glob sees the tool set of
+  the moment. A mask is applied to an agent once per server (the per-agent `restrict` is not replayed on re-sync),
+  so a tool that first appears in a later re-sync is masked for agents created after that re-sync, not for agents
+  that were already masked under the earlier expansion.
 - Startup probing is a snapshot: a server that later grows past the threshold stays revealed until restart (pin it with `mode: lazy`).
 - Images/audio become `[image image/png]` text placeholders; only tools are bridged — MCP resources/prompts/
   progress and task-typed tools are not supported (consistent with `dsh-mcp-client`).
