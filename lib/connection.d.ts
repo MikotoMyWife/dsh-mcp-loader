@@ -10,6 +10,25 @@ export declare const DEFAULT_RECONNECT_ATTEMPTS = 1;
 export declare const DEFAULT_RECONNECT_BACKOFF_MS = 500;
 /** Backoff never exceeds this, whatever the exponent says. */
 export declare const MAX_RETRY_BACKOFF_MS = 30000;
+/** Default discovery hard cap: pages of `tools/list` per real discovery. */
+export declare const DEFAULT_MAX_TOOL_LIST_PAGES = 100;
+/** Default discovery hard cap: raw tools one server may expose. */
+export declare const DEFAULT_MAX_TOOLS_PER_SERVER = 500;
+/** Default discovery deadline for one real pagination, in milliseconds. */
+export declare const DEFAULT_DISCOVERY_TIMEOUT_MS = 60000;
+/** Which discovery hard cap was hit. */
+export type DiscoveryLimitReason = 'pages' | 'tools' | 'timeout';
+/**
+ * A deterministic discovery hard cap was exceeded (or the discovery deadline
+ * passed). The loader never retries these: retrying cannot shrink a server's
+ * catalogue, and a server that does not answer in time rarely will on a second
+ * try. The message names the server and the reason so operators can raise the
+ * right cap.
+ */
+export declare class DiscoveryLimitError extends Error {
+    readonly reason: DiscoveryLimitReason;
+    constructor(serverName: string, reason: DiscoveryLimitReason, limit: number);
+}
 /**
  * Whether a failed connect or discovery is worth retrying.
  *
@@ -18,9 +37,10 @@ export declare const MAX_RETRY_BACKOFF_MS = 30000;
  * `McpError(ConnectionClosed / RequestTimeout)`, while any other `McpError` is
  * an answered protocol error a retry will not fix. Plain errors (spawn
  * failures, our connect wrapper, handshake timeouts) are establish failures by
- * nature and are retried. Slice 03 adds its deterministic discovery caps to the
- * exclusion list here. A failed `tools/call` never reaches this predicate —
- * {@link ServerConnection.callTool} invalidates and rethrows without replaying.
+ * nature and are retried. Deterministic discovery caps (`DiscoveryLimitError`)
+ * are never retried — a retry cannot change how many tools a server exposes.
+ * A failed `tools/call` never reaches this predicate — {@link
+ * ServerConnection.callTool} invalidates and rethrows without replaying.
  */
 export declare function isRetryable(error: unknown): boolean;
 /** The logging surface the plugin needs; Cordis supplies it, tests may not. */

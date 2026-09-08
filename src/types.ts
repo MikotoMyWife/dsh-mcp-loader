@@ -108,6 +108,33 @@ export interface ServerConfig {
    * always-warm v0.5.0 behavior — unload does not close the connection.
    */
   idleDisconnectMs?: number
+  /**
+   * Discovery hard cap: the maximum number of `tools/list` pages fetched for
+   * one real discovery. Cached tool lists are exempt (they were already bound
+   * by the discovery that fetched them). Exceeding it fails the discovery with
+   * a `DiscoveryLimitError` naming this server and `pages` — never retried and
+   * never silently truncated. Defaults to 100.
+   */
+  maxToolListPages?: number
+  /**
+   * Discovery hard cap: the maximum number of tools one server may expose
+   * (counted over raw discovered tools, before any {@link disabledTools}
+   * filtering). Exceeding it fails the discovery with a `DiscoveryLimitError`
+   * naming this server and `tools` — never retried and never truncated, even
+   * if most tools would be filtered afterwards: the cap protects against an
+   * out-of-control server's own catalogue. Defaults to 500.
+   * The check is page-granular: tools are counted page by page, so a single
+   * oversized page can briefly exceed the cap before discovery fails atomically.
+   */
+  maxToolsPerServer?: number
+  /**
+   * Discovery deadline in milliseconds for one real `tools/list` pagination
+   * (cached lists are exempt). A discovery that does not finish in time fails
+   * with a `DiscoveryLimitError` naming this server and `timeout`, and the
+   * connection is dropped so a hung page request never blocks later calls.
+   * Defaults to 60_000.
+   */
+  discoveryTimeoutMs?: number
 }
 
 /** Plugin config. */

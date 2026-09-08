@@ -44,6 +44,13 @@
  * | 27| disabledTools (`suppressed`)                          | tool never registered: absent from assemble, unknown to execute, "loaded 0 tool(s)" log |
  * | 28| disabledTools all tools of an auto server (`dead`)    | probe disposes the loader; no tools; log names the disabledTools count |
  * | 29| lockout protection                                   | static loader-name rule keeps the plugin unmounted; a glob covering the loader warns once and never hides it |
+ * | 30| discovery caps (`pages`/`crowd`/`slow`)                 | load fails, error names pages/tools/timeout, loader kept, repeat loads stay failed |
+ * | 31| invalid discovery-cap config                           | plugin stays unmounted, error names the field + server |
+ * | 32| monotonic discovery generation (`resyncgen`)            | a late, older re-sync snapshot is discarded ("discarded a stale discovery"); the newest generation lands |
+ * | 33| re-sync regression (`resync2`) + empty change + guard    | whole-generation replace stays live (#9 semantics); an empty change keeps the generation stable; duplicate register throws |
+ * | 34| re-sync × hiddenTools masks (`resyncmask`)              | a tool first seen in a re-sync is masked for new agents, not re-masked for already-masked ones |
+ * | 35| hiddenTools public-name glob partial hit (`pmask`)       | denies only the matched tool, others visible and callable |
+ * | 36| disabledTools exact public name / glob spellings         | matched tools never registered, others callable, counts logged |
  */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -66,6 +73,7 @@ const plugin = pluginModule.default ?? pluginModule
 
 const FIXTURE = path.join(here, 'fixtures', 'echo-server.mjs')
 const SINGLE = path.join(here, 'fixtures', 'single-server.mjs')
+const PAGINATED = path.join(here, 'fixtures', 'paginated-server.mjs')
 const FIXTURE_TOOLS = [
   'mcp__fixture__add',
   'mcp__fixture__add_tool',
@@ -245,6 +253,97 @@ ctx.plugin(plugin, {
       hiddenTools: ['ping', 'mcp_lockwild*'],
       command: process.execPath,
       args: [SINGLE],
+    },
+    pages: {
+      description: 'Paginated fixture server whose discovery hits the page cap',
+      mode: 'lazy',
+      maxToolListPages: 2,
+      command: process.execPath,
+      args: [PAGINATED],
+      env: {
+        ECHO_PAGINATE: '1',
+        ECHO_LOG: file('pages.log'),
+      },
+    },
+    crowd: {
+      description: 'Fixture server exposing more tools than the per-server cap',
+      mode: 'lazy',
+      maxToolsPerServer: 4,
+      command: process.execPath,
+      args: [FIXTURE],
+      env: {
+        ECHO_LOG: file('crowd.log'),
+      },
+    },
+    slow: {
+      description: 'Paginated fixture server whose discovery never answers in time',
+      mode: 'lazy',
+      discoveryTimeoutMs: 1500,
+      command: process.execPath,
+      args: [PAGINATED],
+      env: {
+        ECHO_PAGINATE: '1',
+        ECHO_HANG_MS: '60000',
+        ECHO_LOG: file('slow.log'),
+        ECHO_EXIT_MARKER: file('slow.closed'),
+      },
+    },
+    resync2: {
+      description: 'Fixture server re-synced twice (regression of the baseline #9 semantics)',
+      mode: 'lazy',
+      command: process.execPath,
+      args: [FIXTURE],
+      env: {
+        ECHO_LOG: file('resync2.log'),
+      },
+    },
+    resyncgen: {
+      description: 'Paginated fixture server that grows twice while a re-sync is in flight',
+      mode: 'lazy',
+      command: process.execPath,
+      args: [PAGINATED],
+      env: {
+        // late_a at +400ms, late_b at +600ms (each sends list_changed); the
+        // first re-sync's tools/list (request #2) is delayed 1400ms so the
+        // second, newer re-sync always lands first and the older snapshot —
+        // which finishes later — is discarded by the generation guard.
+        ECHO_NOTIFY1_MS: '2000',
+        ECHO_NOTIFY2_MS: '2500',
+        ECHO_SLOW_LIST_INDEX: '2',
+        ECHO_SLOW_LIST_MS: '1400',
+        ECHO_LOG: file('resyncgen.log'),
+      },
+    },
+    resyncmask: {
+      description: 'Masked fixture server whose re-sync introduces a newly maskable tool',
+      mode: 'lazy',
+      hiddenTools: ['echo', 'new_tool'],
+      command: process.execPath,
+      args: [FIXTURE],
+      env: {
+        ECHO_LOG: file('resyncmask.log'),
+      },
+    },
+    pmask: {
+      description: 'Server hiding the echo tool through a partial public-name glob',
+      mode: 'lazy',
+      hiddenTools: ['mcp__pmask__e*'],
+      command: process.execPath,
+      args: [FIXTURE],
+    },
+    dsuppfull: {
+      description: 'Server disabling one tool by its exact public name',
+      mode: 'lazy',
+      disabledTools: ['mcp__dsuppfull__add'],
+      command: process.execPath,
+      args: [FIXTURE],
+    },
+    dsuppglob: {
+      description: 'Server disabling tools through raw and public-name globs',
+      mode: 'lazy',
+      disabledTools: ['f*', 'mcp__dsuppglob__s*'],
+      command: process.execPath,
+      args: [FIXTURE],
     },
   },
 })
@@ -747,6 +846,325 @@ await check(29, 'a rule naming its own loader keeps the plugin unmounted or warn
   } finally {
     await scope.dispose()
   }
+})
+
+await check(30, 'discovery caps: pages/tools/timeout fail the load, name the reason, keep the loader', async () => {
+  const expectCapFailure = async (serverName, reasonNeedle) => {
+    const first = await call(`mcp_${serverName}`, {})
+    assert.equal(first.isError, true, textOf(first))
+    assert.match(textOf(first), reasonNeedle, `reason not named: ${textOf(first)}`)
+    assert.ok(visible().includes(`mcp_${serverName}`), 'the loader must survive a discovery-cap failure')
+    assert.ok(
+      !visible().some((name) => name.startsWith(`mcp__${serverName}__`)),
+      `tools were registered despite the ${serverName} cap`,
+    )
+    // A repeat load fails the same deterministic way: no half-loaded state.
+    const again = await call(`mcp_${serverName}`, {})
+    assert.equal(again.isError, true, textOf(again))
+    assert.match(textOf(again), reasonNeedle, `reason not named on retry: ${textOf(again)}`)
+    assert.ok(
+      !visible().some((name) => name.startsWith(`mcp__${serverName}__`)),
+      `tools were registered on the ${serverName} retry`,
+    )
+  }
+  // Pages: the paginated fixture needs 3 pages (pageSize 2); capped at 2 the
+  // discovery stops exactly after page 2 without requesting page 3, and keeps
+  // the same child alive across attempts (the cap is not a transport failure).
+  await expectCapFailure('pages', /page limit of 2 pages/)
+  assert.equal(countLines('pages.log', 'list'), 4, 'expected 2 pages per attempt × 2 attempts')
+  assert.equal(countLines('pages.log', 'start'), 1, 'the pages cap must not drop the healthy client')
+  // Tools: the echo fixture exposes 6 raw tools; capped at 4 the discovery
+  // stops after the page that overflows the cap.
+  await expectCapFailure('crowd', /tool limit of 4 tools/)
+  assert.equal(countLines('crowd.log', 'start'), 1, 'the tools cap must not drop the healthy client')
+  // Timeout: every tools/list hangs 60s; the 1500ms discovery deadline fails
+  // the load and drops the client (the hung child is closed — exit marker),
+  // so a later load reconnects to a fresh child and fails again, consistently.
+  const slowFirst = await call('mcp_slow', {})
+  assert.equal(slowFirst.isError, true, textOf(slowFirst))
+  assert.match(textOf(slowFirst), /discovery timeout of 1500ms/, `reason not named: ${textOf(slowFirst)}`)
+  assert.ok(visible().includes('mcp_slow'), 'the loader must survive a discovery-timeout failure')
+  await waitForLines('slow.closed', (lines) => lines.includes('closed'), 'the hung child to be closed by the discovery timeout')
+  const slowAgain = await call('mcp_slow', {})
+  assert.equal(slowAgain.isError, true, textOf(slowAgain))
+  assert.match(textOf(slowAgain), /discovery timeout of 1500ms/, `reason not named on retry: ${textOf(slowAgain)}`)
+  assert.ok(
+    !visible().some((name) => name.startsWith('mcp__slow__')),
+    'tools were registered despite the discovery timeout',
+  )
+  assert.equal(countLines('slow.log', 'start'), 2, 'each slow attempt must reconnect to a fresh child')
+})
+
+await check(31, 'an invalid discovery-cap config keeps the plugin unmounted and names the field', async () => {
+  const expectUnmounted = async (serverName, serverConfig, needle) => {
+    const isolated = new Context()
+    isolated.plugin(SystemPrompt)
+    isolated.plugin(ToolRuntime, {})
+    await waitFor(() => isolated.tools !== undefined, 'the isolated tools service')
+    const lines = []
+    isolated.logger.exporter({
+      levels: { default: 99 },
+      export(message) {
+        for (const arg of message.args ?? []) {
+          lines.push(arg instanceof Error ? arg.message : String(arg))
+        }
+      },
+    })
+    isolated.plugin(plugin, { servers: { [serverName]: serverConfig } })
+    await waitFor(
+      () => lines.some((line) => line.includes(needle) && line.includes(`"${serverName}"`)),
+      `the mount error naming ${needle}`,
+    )
+    assert.ok(
+      !isolated.tools.schemas().some((entry) => entry.name.startsWith('mcp_')),
+      `a loader was registered despite ${needle}`,
+    )
+    await isolated.fiber.dispose()
+  }
+  await expectUnmounted(
+    'badpages',
+    { maxToolListPages: 0, command: process.execPath, args: [PAGINATED] },
+    '"maxToolListPages" must be a positive integer',
+  )
+  await expectUnmounted(
+    'badcap',
+    { maxToolsPerServer: 2.5, command: process.execPath, args: [FIXTURE] },
+    '"maxToolsPerServer" must be a positive integer',
+  )
+  await expectUnmounted(
+    'badtimeout',
+    { discoveryTimeoutMs: -1, command: process.execPath, args: [FIXTURE] },
+    '"discoveryTimeoutMs" must be a positive integer',
+  )
+})
+
+await check(32, 'a late, older re-sync snapshot is discarded; only the newest generation lands', async () => {
+  // `resyncgen` grows its list at +400ms (`late_a`) and +600ms (`late_b`), each
+  // emitting list_changed. The first re-sync's tools/list request is delayed
+  // 1400ms, so the second (newer-versioned) re-sync always lands first and the
+  // older snapshot — which necessarily completes later — is dropped by the
+  // monotonic-generation landing check instead of overwriting the newer one.
+  const first = await call('mcp_resyncgen', {})
+  assert.equal(first.isError, false, textOf(first))
+  for (const tool of ['add', 'add_tool', 'die', 'echo', 'fail', 'structured']) {
+    assert.ok(visible().includes(`mcp__resyncgen__${tool}`), `base tool ${tool} missing after the load`)
+  }
+  await waitFor(
+    () => visible().includes('mcp__resyncgen__late_a') && visible().includes('mcp__resyncgen__late_b'),
+    'both growth re-syncs to land',
+    10_000,
+  )
+  await waitFor(
+    () =>
+      logLines.some(
+        (line) => line.includes('discarded a stale discovery') && line.includes('"resyncgen"'),
+      ),
+    'the stale-discovery discard log',
+    10_000,
+  )
+  // Stability: once the newest generation landed and the stale one was
+  // discarded, nothing may regress the generation afterwards.
+  await new Promise((resolve) => setTimeout(resolve, 600))
+  const names = visible()
+  assert.ok(names.includes('mcp__resyncgen__late_a'), 'late_a missing from the final generation')
+  assert.ok(names.includes('mcp__resyncgen__late_b'), 'late_b missing from the final generation')
+  const only = names.filter((name) => name.startsWith('mcp__resyncgen__')).sort()
+  assert.deepEqual(
+    only,
+    ['mcp__resyncgen__add', 'mcp__resyncgen__add_tool', 'mcp__resyncgen__die', 'mcp__resyncgen__echo',
+      'mcp__resyncgen__fail', 'mcp__resyncgen__late_a', 'mcp__resyncgen__late_b', 'mcp__resyncgen__structured'],
+    `unexpected final generation: ${JSON.stringify(only)}`,
+  )
+  const lateA = await call('mcp__resyncgen__late_a', {})
+  assert.equal(lateA.isError, false, textOf(lateA))
+  assert.equal(textOf(lateA), 'late_a ok')
+  const lateB = await call('mcp__resyncgen__late_b', {})
+  assert.equal(lateB.isError, false, textOf(lateB))
+  assert.equal(textOf(lateB), 'late_b ok')
+})
+
+await check(33, 'a re-sync replaces the generation whole; an empty change leaves it stable', async () => {
+  // Baseline of #9 on a dedicated server: load → add_tool → the new tool is
+  // live and callable through the real registry.
+  const load = await call('mcp_resync2', {})
+  assert.equal(load.isError, false, textOf(load))
+  const added = await call('mcp__resync2__add_tool', {})
+  assert.equal(added.isError, false, textOf(added))
+  await waitFor(() => visible().includes('mcp__resync2__new_tool'), 'the re-synced generation of resync2')
+  const created = await call('mcp__resync2__new_tool', {})
+  assert.equal(created.isError, false, textOf(created))
+  assert.equal(textOf(created), 'new_tool ok')
+  const before = visible().filter((name) => name.startsWith('mcp__resync2__')).sort()
+  // An empty change (new_tool already present) still re-syncs: the whole
+  // generation is replaced by identical content and stays live.
+  const again = await call('mcp__resync2__add_tool', {})
+  assert.equal(again.isError, false, textOf(again))
+  await new Promise((resolve) => setTimeout(resolve, 600))
+  const after = visible().filter((name) => name.startsWith('mcp__resync2__')).sort()
+  assert.deepEqual(after, before, 'the empty change must not alter the generation')
+  const created2 = await call('mcp__resync2__new_tool', {})
+  assert.equal(created2.isError, false, textOf(created2))
+  assert.equal(textOf(created2), 'new_tool ok')
+  // Guard (slice 03 step 0): the re-sync ordering relies on duplicate-name
+  // registration throwing — assert the installed registry still does, so a
+  // future dsh upgrade that silently overwrites would fail this test loudly.
+  const guardDefinition = {
+    name: 'probe_dup_guard',
+    description: 'duplicate-register guard probe',
+    parameters: { type: 'object', properties: {} },
+    output: {
+      schema: { type: 'object', properties: {} },
+      render(_args, value) {
+        return [{ type: 'text', text: 'guard' }]
+      },
+    },
+  }
+  let disposer
+  try {
+    disposer = ctx.tools.register(guardDefinition)
+    assert.throws(
+      () => ctx.tools.register({ ...guardDefinition }),
+      /already registered/,
+      'a duplicate global register must throw (never overwrite silently)',
+    )
+  } finally {
+    disposer?.()
+  }
+})
+
+await check(34, 'a tool first seen in a re-sync is masked for new agents, not for already-masked ones', async () => {
+  // README claim: a deny mask is applied once per server per agent; a tool
+  // that first appears in a later re-sync is masked for agents created after
+  // that re-sync, but not for agents masked under the earlier expansion.
+  const keyA = { id: 'maskgrow-a' }
+  let scopeA
+  ctx.plugin({
+    name: 'test-maskgrow-a',
+    inject: ['tools'],
+    apply(mintCtx) {
+      scopeA = createScope(mintCtx, keyA)
+    },
+  })
+  await waitFor(() => scopeA !== undefined, 'the maskgrow agent A scope')
+  const agentA = { ctx: scopeA.ctx }
+  try {
+    // Load via agent A: at this point only `echo` matches the rules, so A is
+    // masked for echo — `new_tool` does not exist yet.
+    const loaded = await call('mcp_resyncmask', {}, agentA)
+    assert.equal(textOf(loaded), 'ok')
+    assert.ok(!visible(keyA).includes('mcp__resyncmask__echo'), 'echo must be masked for the loader agent')
+    // Grow: new_tool appears in a re-sync (the deny mask now covers it too).
+    const added = await call('mcp__resyncmask__add_tool', {})
+    assert.equal(added.isError, false, textOf(added))
+    await waitFor(() => visible().includes('mcp__resyncmask__new_tool'), 'the resyncmask re-sync')
+    // Agent A was masked before the re-sync and is not re-masked: new_tool is
+    // visible to it, while its earlier mask persists.
+    const scopedA = visible(keyA)
+    assert.ok(!scopedA.includes('mcp__resyncmask__echo'), 'the earlier mask must persist for agent A')
+    assert.ok(
+      scopedA.includes('mcp__resyncmask__new_tool'),
+      'a pre-existing agent must not be re-masked for a re-synced tool',
+    )
+    // Agent B created after the re-sync gets the refreshed deny set, which
+    // includes new_tool (mirrors the agent/created path of the real harness).
+    const keyB = { id: 'maskgrow-b' }
+    let scopeB
+    ctx.plugin({
+      name: 'test-maskgrow-b',
+      inject: ['tools'],
+      apply(mintCtx) {
+        scopeB = createScope(mintCtx, keyB)
+      },
+    })
+    await waitFor(() => scopeB !== undefined, 'the maskgrow agent B scope')
+    try {
+      ctx.emit('agent/created', { agent: { ctx: scopeB.ctx } })
+      await waitFor(
+        () => !visible(keyB).includes('mcp__resyncmask__new_tool'),
+        'agent B to be masked with the refreshed deny set',
+      )
+      const scopedB = visible(keyB)
+      assert.ok(!scopedB.includes('mcp__resyncmask__echo'), 'agent B must carry the base mask')
+      assert.ok(!scopedB.includes('mcp__resyncmask__new_tool'), 'agent B must be masked for the re-synced tool')
+    } finally {
+      await scopeB.dispose()
+    }
+    // The tools stay globally registered for everyone else.
+    assert.ok(visible().includes('mcp__resyncmask__new_tool'), 'new_tool must stay globally registered')
+  } finally {
+    await scopeA.dispose()
+  }
+})
+
+await check(35, 'a public-name glob that partially hits denies exactly the matched tool', async () => {
+  // Slice-2 review leftover: hiddenTools spelled as a public-name glob that
+  // only partially covers the server (`mcp__pmask__e*` matches only `echo` of
+  // the six tools). The deny list must be exactly that one tool.
+  const agentKey = { id: 'pmask-scope' }
+  let scope
+  ctx.plugin({
+    name: 'test-pmask-scope',
+    inject: ['tools'],
+    apply(mintCtx) {
+      scope = createScope(mintCtx, agentKey)
+    },
+  })
+  await waitFor(() => scope !== undefined, 'the pmask test scope')
+  try {
+    const agent = { ctx: scope.ctx }
+    const result = await call('mcp_pmask', {}, agent)
+    assert.equal(textOf(result), 'ok')
+    assert.ok(visible().includes('mcp__pmask__echo'), 'echo must stay globally registered')
+    const scoped = visible(agentKey)
+    assert.ok(!scoped.includes('mcp__pmask__echo'), `expected partial public glob to hide echo, but it stayed visible: ${JSON.stringify(scoped)}`)
+    assert.ok(scoped.includes('mcp__pmask__add'), 'partial public glob denied a non-matching tool')
+    const added = await call('mcp__pmask__add', { a: 2, b: 3 })
+    assert.equal(added.isError, false, textOf(added))
+    assert.equal(textOf(added), '5')
+  } finally {
+    await scope.dispose()
+  }
+})
+
+await check(36, 'disabledTools exact public name and glob spellings never register matched tools', async () => {
+  // Slice-2 review leftover: the disabledTools axis was only ever tested with
+  // an exact raw name (#27/#28). Cover the exact public full name and both
+  // glob spellings: the matched tools must never register, the rest stays
+  // callable, and the loaded counts reflect the filtered set.
+  const loadedPublic = await call('mcp_dsuppfull', {})
+  assert.equal(loadedPublic.isError, false, textOf(loadedPublic))
+  assert.ok(!visible().includes('mcp__dsuppfull__add'), 'a public exact-name disabled tool was registered')
+  assert.ok(visible().includes('mcp__dsuppfull__echo'), 'the non-disabled tool is missing')
+  const unknown1 = await call('mcp__dsuppfull__add', { a: 1, b: 2 })
+  assert.equal(unknown1.isError, true, 'a public exact-name disabled tool must not be callable')
+  assert.match(textOf(unknown1), /unknown tool/, `unexpected text: ${textOf(unknown1)}`)
+  const echoed1 = await call('mcp__dsuppfull__echo', { text: 'hi' })
+  assert.equal(echoed1.isError, false, textOf(echoed1))
+  assert.equal(textOf(echoed1), 'echo:hi')
+  assert.ok(
+    logLines.some((line) => line.includes('loaded 5 tool(s) from "dsuppfull"')),
+    `missing the dsuppfull filtered count: ${JSON.stringify(logLines.slice(-10))}`,
+  )
+  const loadedGlob = await call('mcp_dsuppglob', {})
+  assert.equal(loadedGlob.isError, false, textOf(loadedGlob))
+  // `f*` (raw glob) matches `fail`; `mcp__dsuppglob__s*` (public glob) matches
+  // `structured`. The other four tools must stay registered and callable.
+  for (const gone of ['fail', 'structured']) {
+    assert.ok(!visible().includes(`mcp__dsuppglob__${gone}`), `a glob-disabled tool was registered: ${gone}`)
+  }
+  for (const kept of ['add', 'echo']) {
+    assert.ok(visible().includes(`mcp__dsuppglob__${kept}`), `glob rules disabled too much: ${kept}`)
+  }
+  const unknown2 = await call('mcp__dsuppglob__fail', {})
+  assert.equal(unknown2.isError, true, 'a glob-disabled tool must not be callable')
+  assert.match(textOf(unknown2), /unknown tool/, `unexpected text: ${textOf(unknown2)}`)
+  const echoed2 = await call('mcp__dsuppglob__echo', { text: 'yo' })
+  assert.equal(echoed2.isError, false, textOf(echoed2))
+  assert.equal(textOf(echoed2), 'echo:yo')
+  assert.ok(
+    logLines.some((line) => line.includes('loaded 4 tool(s) from "dsuppglob"')),
+    `missing the dsuppglob filtered count: ${JSON.stringify(logLines.slice(-10))}`,
+  )
 })
 
 const failures = results.filter((entry) => entry.status === 'FAIL')

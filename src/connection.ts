@@ -36,6 +36,37 @@ export const DEFAULT_RECONNECT_ATTEMPTS = 1
 export const DEFAULT_RECONNECT_BACKOFF_MS = 500
 /** Backoff never exceeds this, whatever the exponent says. */
 export const MAX_RETRY_BACKOFF_MS = 30_000
+/** Default discovery hard cap: pages of `tools/list` per real discovery. */
+export const DEFAULT_MAX_TOOL_LIST_PAGES = 100
+/** Default discovery hard cap: raw tools one server may expose. */
+export const DEFAULT_MAX_TOOLS_PER_SERVER = 500
+/** Default discovery deadline for one real pagination, in milliseconds. */
+export const DEFAULT_DISCOVERY_TIMEOUT_MS = 60_000
+
+/** Which discovery hard cap was hit. */
+export type DiscoveryLimitReason = 'pages' | 'tools' | 'timeout'
+
+/**
+ * A deterministic discovery hard cap was exceeded (or the discovery deadline
+ * passed). The loader never retries these: retrying cannot shrink a server's
+ * catalogue, and a server that does not answer in time rarely will on a second
+ * try. The message names the server and the reason so operators can raise the
+ * right cap.
+ */
+export class DiscoveryLimitError extends Error {
+  readonly reason: DiscoveryLimitReason
+  constructor(serverName: string, reason: DiscoveryLimitReason, limit: number) {
+    const detail =
+      reason === 'pages'
+        ? `discovery page limit of ${limit} pages exceeded (maxToolListPages)`
+        : reason === 'tools'
+          ? `discovery tool limit of ${limit} tools exceeded (maxToolsPerServer)`
+          : `discovery timeout of ${limit}ms exceeded (discoveryTimeoutMs)`
+    super(`MCP server "${serverName}" ${detail}`)
+    this.name = 'DiscoveryLimitError'
+    this.reason = reason
+  }
+}
 
 /**
  * Whether a failed connect or discovery is worth retrying.
@@ -45,11 +76,13 @@ export const MAX_RETRY_BACKOFF_MS = 30_000
  * `McpError(ConnectionClosed / RequestTimeout)`, while any other `McpError` is
  * an answered protocol error a retry will not fix. Plain errors (spawn
  * failures, our connect wrapper, handshake timeouts) are establish failures by
- * nature and are retried. Slice 03 adds its deterministic discovery caps to the
- * exclusion list here. A failed `tools/call` never reaches this predicate —
- * {@link ServerConnection.callTool} invalidates and rethrows without replaying.
+ * nature and are retried. Deterministic discovery caps (`DiscoveryLimitError`)
+ * are never retried — a retry cannot change how many tools a server exposes.
+ * A failed `tools/call` never reaches this predicate — {@link
+ * ServerConnection.callTool} invalidates and rethrows without replaying.
  */
 export function isRetryable(error: unknown): boolean {
+  if (error instanceof DiscoveryLimitError) return false
   if (error instanceof McpError) {
     return error.code === ErrorCode.ConnectionClosed || error.code === ErrorCode.RequestTimeout
   }
@@ -135,13 +168,19 @@ export function validateServerConfig(name: string, config: ServerConfig): string
       problems.push(`"${field}" must be a non-negative integer`)
     }
   }
+  for (const field of ['maxToolListPages', 'maxToolsPerServer', 'discoveryTimeoutMs'] as const) {
+    const value = config[field]
+    if (value !== undefined && (!Number.isInteger(value) || value <= 0)) {
+      problems.push(`"${field}" must be a positive integer`)
+    }
+  }
   return problems
 }
 
 /** Reject after `ms` when `promise` has not settled. */
-function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, ms: number, what: string, onTimeout?: () => Error): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms: ${what}`)), ms)
+    const timer = setTimeout(() => reject(onTimeout ? onTimeout() : new Error(`timed out after ${ms}ms: ${what}`)), ms)
     promise.then(
       (value) => {
         clearTimeout(timer)
@@ -163,6 +202,9 @@ export class ServerConnection {
   #toolCallTimeoutMs: number
   #reconnectAttempts: number
   #reconnectBackoffMs: number
+  #maxToolListPages: number
+  #maxToolsPerServer: number
+  #discoveryTimeoutMs: number
   #client: Client | undefined
   #connecting: Promise<Client> | undefined
   #tools: DiscoveredTool[] | undefined
@@ -183,6 +225,9 @@ export class ServerConnection {
     this.#toolCallTimeoutMs = config.toolCallTimeoutMs ?? DEFAULT_TOOL_CALL_TIMEOUT_MS
     this.#reconnectAttempts = config.reconnectAttempts ?? DEFAULT_RECONNECT_ATTEMPTS
     this.#reconnectBackoffMs = config.reconnectBackoffMs ?? DEFAULT_RECONNECT_BACKOFF_MS
+    this.#maxToolListPages = config.maxToolListPages ?? DEFAULT_MAX_TOOL_LIST_PAGES
+    this.#maxToolsPerServer = config.maxToolsPerServer ?? DEFAULT_MAX_TOOLS_PER_SERVER
+    this.#discoveryTimeoutMs = config.discoveryTimeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS
   }
 
   /**
@@ -337,9 +382,13 @@ export class ServerConnection {
         // A failure after a successful connect leaves the client in an unknown
         // state. Drop it so the retry — and every later call — reconnects;
         // deterministic failures still surface (after invalidation) when the
-        // retry budget is exhausted or the error is non-transient.
+        // retry budget is exhausted or the error is non-transient. A discovery
+        // deadline expiry can leave a page request hanging on a slow server, so
+        // it also drops the client — a later call must reconnect rather than
+        // queue behind the stale request. (Page/tool caps follow a complete
+        // answer and keep the healthy client.)
         this.#tools = undefined
-        if (isRetryable(error)) {
+        if (isRetryable(error) || (error instanceof DiscoveryLimitError && error.reason === 'timeout')) {
           this.#client = undefined
           this.#dropped = true
           await client.close().catch(() => {})
@@ -349,27 +398,49 @@ export class ServerConnection {
     })
   }
 
+  /**
+   * Fetch one server's full tool list over the real network, bounded by the
+   * discovery caps: at most `maxToolListPages` pages, at most
+   * `maxToolsPerServer` raw tools, and an overall `discoveryTimeoutMs`
+   * deadline around the pagination. Exceeding any cap throws a
+   * {@link DiscoveryLimitError} naming the server and the reason.
+   */
   async #discover(client: Client): Promise<DiscoveredTool[]> {
     const discovered: DiscoveredTool[] = []
     const seen = new Set<string>()
     let cursor: string | undefined
-    do {
-      const page = await client.listTools(cursor === undefined ? undefined : { cursor })
-      for (const tool of page.tools) {
-        const publicName = publicToolName(this.name, tool.name)
-        if (seen.has(publicName)) {
-          throw new Error(`MCP server "${this.name}" lists tool "${tool.name}" more than once; its tool list is invalid`)
-        }
-        seen.add(publicName)
-        discovered.push({
-          rawName: tool.name,
-          publicName,
-          description: tool.description ?? '',
-          inputSchema: tool.inputSchema,
-        })
-      }
-      cursor = page.nextCursor
-    } while (cursor !== undefined)
+    let pages = 0
+    await withTimeout(
+      (async () => {
+        do {
+          pages += 1
+          if (pages > this.#maxToolListPages) {
+            throw new DiscoveryLimitError(this.name, 'pages', this.#maxToolListPages)
+          }
+          const page = await client.listTools(cursor === undefined ? undefined : { cursor })
+          for (const tool of page.tools) {
+            const publicName = publicToolName(this.name, tool.name)
+            if (seen.has(publicName)) {
+              throw new Error(`MCP server "${this.name}" lists tool "${tool.name}" more than once; its tool list is invalid`)
+            }
+            seen.add(publicName)
+            discovered.push({
+              rawName: tool.name,
+              publicName,
+              description: tool.description ?? '',
+              inputSchema: tool.inputSchema,
+            })
+          }
+          if (discovered.length > this.#maxToolsPerServer) {
+            throw new DiscoveryLimitError(this.name, 'tools', this.#maxToolsPerServer)
+          }
+          cursor = page.nextCursor
+        } while (cursor !== undefined)
+      })(),
+      this.#discoveryTimeoutMs,
+      `discovering tools of MCP server "${this.name}"`,
+      () => new DiscoveryLimitError(this.name, 'timeout', this.#discoveryTimeoutMs),
+    )
     return discovered
   }
 

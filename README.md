@@ -49,6 +49,12 @@ at startup and stay resident without a loader.
 - **Resilience** — atomic registration (any failure rolls the server back to zero tools), shared concurrent
   attempts, `list_changed` resync (full-generation replace), raw `tools/call` (skips outputSchema validation of
   `structuredContent`, same as the official client), transport-failure discard-and-reconnect on next call.
+- **Discovery hard caps** — per server, a real discovery is bounded by `maxToolListPages` pages, `maxToolsPerServer`
+  raw tools and a `discoveryTimeoutMs` deadline; exceeding any of them fails the load/re-sync with an error naming
+  the server and the reason, keeps the loader tool, and is never retried.
+- **Ordered re-syncs** — a per-server monotonic discovery generation makes sure two concurrent `list_changed`
+  re-syncs (or a re-sync racing a load) can never have an older snapshot land after — and overwrite — a newer one:
+  a stale discovery result is discarded instead of being applied.
 - **Transports** — `stdio` (spawn `command`/`args`, `env` merged into the SDK default environment) and
   `streamable-http` (`url`/`headers`).
 - **Config fail-fast** — unknown preset or invalid server name (`[A-Za-z0-9_-]{1,32}`) fails plugin mount with a
@@ -100,6 +106,9 @@ Then register the plugin in your profile (id `mcp-loader`, package `dsh-mcp-load
 | `servers.<n>.reconnectAttempts` | `1` | Per user-visible operation (a loader load, a tool call, a startup probe): retries after a failed connect/discovery — connect and discovery share one budget of `reconnectAttempts + 1` tries (`0` = exactly one attempt, v0.5.0 behavior) |
 | `servers.<n>.reconnectBackoffMs` | `500` | Base retry delay; each retry doubles it (×2ⁿ), capped at 30s |
 | `servers.<n>.idleDisconnectMs` | `0` | Close an unloaded server's MCP connection after this idle time (`0` = always warm); the next load reconnects |
+| `servers.<n>.maxToolListPages` | `100` | Discovery hard cap: max `tools/list` pages per real discovery; exceeding it fails the load/re-sync naming `pages` (never retried, never truncated) |
+| `servers.<n>.maxToolsPerServer` | `500` | Discovery hard cap: max raw tools one server may expose; exceeding it fails naming `tools` (counted before `disabledTools`) |
+| `servers.<n>.discoveryTimeoutMs` | `60000` | Discovery deadline for one real pagination; a timeout fails naming `timeout` and drops the connection so a hung server never blocks later calls |
 | `connectTimeoutMs` | `30000` | Connection handshake timeout |
 | `singleToolThreshold` | `1` | `auto` mode: servers with ≤ this many tools stay resident |
 | `loaderHint` | `Call to load this MCP server's tools; call again to hide them.` | Appended to every loader description |
@@ -146,11 +155,12 @@ disabledTools)`), and under `auto`/`eager` the startup probe removes the loader 
 returns if you edit its configuration and restart (keep `mode: lazy` if you may want to re-enable tools without a
 restart).
 
-**Interaction with the discovery caps (slice 03).** The per-server tool-count caps live in the connection layer and
-count *raw discovered* tools, while `disabledTools` filters later, in the loader layer. A server that reports more
-raw tools than the cap will therefore fail discovery before `disabledTools` can help — that is intentional: the
-cap protects against an out-of-control server's own catalogue, not against your configuration of it. Raise the cap
-or drop the server if you need to ban most of a huge catalogue.
+**Interaction with the discovery caps.** The per-server discovery caps live in the connection layer and
+count *raw discovered* tools (pages / tool count / deadline), while `disabledTools` filters later, in the loader
+layer. A server that reports more raw tools than the cap will therefore fail discovery before `disabledTools` can
+help — that is intentional: the cap protects against an out-of-control server's own catalogue, not against your
+configuration of it. Raise the cap or drop the server if you need to ban most of a huge catalogue. Cap failures
+are deterministic and are never retried.
 
 ## Known limitations
 
@@ -167,13 +177,14 @@ or drop the server if you need to ban most of a huge catalogue.
   a failed `tools/call` is surfaced immediately and never replayed. There is no eager background keep-alive/reconnect —
   an idle server with `idleDisconnectMs: 0` (the default) stays warm indefinitely, and one with `idleDisconnectMs > 0`
   is disconnected only while it has no loaded tools, reconnecting on the next load.
-- Known lifecycle edges (accepted for now; a connection "generation" scheme is a later slice):
+- Known lifecycle edges (accepted for now; a connection "generation" scheme for these is a later slice):
   - Disconnecting while another caller is connecting can, in a narrow window, leave two spawned children and orphan
     the losing one.
   - An idle disconnect waits for a connect attempt already in flight (up to `connectTimeoutMs`) before closing; retries
     that were only scheduled are cancelled instead of delaying the disconnect.
   - With the default `reconnectAttempts: 1`, deterministic discovery errors (e.g. a duplicated tool name) are retried
-    once before surfacing; slice 03 adds explicit exclusions (DiscoveryLimitError and friends).
+    once before surfacing. Discovery hard caps are the exception: a `DiscoveryLimitError` (page/tool limit or
+    deadline) is deterministic and surfaces immediately, never retried.
 
 ## Ecosystem position
 

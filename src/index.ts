@@ -390,6 +390,46 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     return next
   }
 
+  /**
+   * Monotonic per-server discovery generations (slice 03).
+   *
+   * Discovery results are fetched over the network by several independent
+   * dispatches (a loader load, each `list_changed` re-sync), and completion
+   * order does not follow dispatch order — an older snapshot can finish last
+   * and would overwrite a newer one. Every dispatch takes a version from
+   * {@link beginDiscovery}; a landing applies only while no newer discovery has
+   * already landed ({@link mayApplyDiscovery}), and a successful landing raises
+   * the watermark ({@link commitDiscovery}). The maps are written in exactly
+   * those two helpers — the two review points of slice 03.
+   *
+   * Landing is gated on the *watermark*, not on "still the latest dispatch":
+   * a re-sync that fires while a first load is in flight lands nothing (see
+   * {@link swapGeneration}: an unloaded server is never re-synced into
+   * existence), so gating the load on "latest dispatch" would wrongly discard
+   * its landing and leave the server never-loaded.
+   */
+  /** server name -> version of the newest discovery dispatch (+1 per dispatch). */
+  const discoveryVersions = new Map<string, number>()
+  /** server name -> version of the newest discovery that actually landed. */
+  const landedVersions = new Map<string, number>()
+
+  /** Advance point 1 of 2 (slice 03): a new discovery dispatch takes the next version. */
+  function beginDiscovery(serverName: string): number {
+    const next = (discoveryVersions.get(serverName) ?? 0) + 1
+    discoveryVersions.set(serverName, next)
+    return next
+  }
+
+  /** Advance point 2 of 2 (slice 03): a discovery may land while nothing newer landed. */
+  function mayApplyDiscovery(serverName: string, version: number): boolean {
+    return version >= (landedVersions.get(serverName) ?? 0)
+  }
+
+  /** Record a successful landing; the watermark only ever rises. */
+  function commitDiscovery(serverName: string, version: number): void {
+    landedVersions.set(serverName, version)
+  }
+
   /** Load one server's tools, deduplicating concurrent attempts. */
   function loadServer(connection: ServerConnection, caller?: unknown): Promise<Map<string, () => void>> {
     const existing = loaded.get(connection.name)
@@ -397,13 +437,27 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     const inflight = pending.get(connection.name)
     if (inflight !== undefined) return inflight
     const attempt = (async () => {
+      // A load is a new discovery dispatch: it takes the next generation
+      // version (advance point 1 of 2).
+      const version = beginDiscovery(connection.name)
       try {
         const discovered = await connection.listTools()
         const available = applyToolFilter(connection, discovered)
+        // Landing validation (advance point 2 of 2): never land a snapshot once
+        // a newer discovery already landed. Defensive here — a first load is
+        // the only landing producer from an empty state (a re-sync never swaps
+        // an unloaded server), so this can only trip if that invariant changes.
+        if (!mayApplyDiscovery(connection.name, version)) {
+          logger.info(
+            `[tool-aggregator] discarded a stale discovery for "${connection.name}" (a newer one already applied)`,
+          )
+          return new Map<string, () => void>()
+        }
         if (available.length === 0) {
           // No usable tools: either the server exposes none or `disabledTools`
           // suppressed them all. Both end as an empty generation.
           const empty = new Map<string, () => void>()
+          commitDiscovery(connection.name, version)
           loaded.set(connection.name, empty)
           denyMasks.delete(connection.name)
           clearIdleTimer(connection.name)
@@ -415,6 +469,7 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
           return empty
         }
         const generation = registerGeneration(connection, available)
+        commitDiscovery(connection.name, version)
         loaded.set(connection.name, generation)
         refreshDenyMask(connection.name, available)
         clearIdleTimer(connection.name)
@@ -502,10 +557,17 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
    * Replace the live generation for a server after its tool list changed.
    * `discovered` must already be `disabledTools`-filtered (resync does that
    * before calling); the deny mask is refreshed here against what registered.
+   * Order is unchanged: dispose the previous generation first, then register
+   * the next (a duplicate-name register throws — see slice 03 step 0 — so
+   * register-new-then-dispose-old is impossible).
+   *
+   * Returns whether a generation was actually replaced: `false` when the
+   * server had nothing loaded (a re-sync never loads an unloaded server into
+   * existence) or when re-registration failed and the server was unloaded.
    */
-  function swapGeneration(connection: ServerConnection, discovered: DiscoveredTool[]): void {
+  function swapGeneration(connection: ServerConnection, discovered: DiscoveredTool[]): boolean {
     const previous = loaded.get(connection.name)
-    if (previous === undefined || previous.size === 0) return
+    if (previous === undefined || previous.size === 0) return false
     for (const dispose of previous.values()) {
       try {
         dispose()
@@ -517,6 +579,7 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
       loaded.set(connection.name, registerGeneration(connection, discovered))
       refreshDenyMask(connection.name, discovered)
       clearIdleTimer(connection.name)
+      return true
     } catch (error) {
       loaded.delete(connection.name)
       denyMasks.delete(connection.name)
@@ -524,10 +587,15 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
         `[tool-aggregator] re-sync of "${connection.name}" could not re-register its tools: ${messageOf(error)}; that server is now unloaded`,
       )
       reconcileIdleTimer(connection.name)
+      return false
     }
   }
 
   async function resync(connection: ServerConnection): Promise<void> {
+    // A re-sync is a new discovery dispatch: every `list_changed` bumps the
+    // generation (advance point 1 of 2), so of two concurrent re-syncs the
+    // older snapshot can never land after — and overwrite — the newer one.
+    const version = beginDiscovery(connection.name)
     let discovered: DiscoveredTool[]
     try {
       discovered = await connection.listTools(true)
@@ -540,8 +608,19 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
       return
     }
     const available = applyToolFilter(connection, discovered)
-    swapGeneration(connection, available)
-    logger.info(`[tool-aggregator] re-synced "${connection.name}" (${available.length} tools)`)
+    // Landing validation (advance point 2 of 2): a stale snapshot (fetched
+    // before a newer re-sync landed) is dropped instead of swapping the newer
+    // generation back to older content.
+    if (!mayApplyDiscovery(connection.name, version)) {
+      logger.info(
+        `[tool-aggregator] re-sync of "${connection.name}" discarded a stale discovery (a newer one already applied)`,
+      )
+      return
+    }
+    if (swapGeneration(connection, available)) {
+      commitDiscovery(connection.name, version)
+      logger.info(`[tool-aggregator] re-synced "${connection.name}" (${available.length} tools)`)
+    }
     // Normally a disarm/no-op (a re-sync only swaps an already-loaded
     // generation). When it ends with no loaded tools — e.g. it raced an idle
     // disconnect that a retry had revived — re-arming keeps the timer correct.
@@ -636,6 +715,8 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     }
     loaded.clear()
     pending.clear()
+    discoveryVersions.clear()
+    landedVersions.clear()
     for (const timer of idleTimers.values()) clearTimeout(timer)
     idleTimers.clear()
     idleDisconnectCount.clear()
