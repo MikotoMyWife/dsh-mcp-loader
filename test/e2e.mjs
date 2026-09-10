@@ -51,6 +51,12 @@
  * | 34| re-sync × hiddenTools masks (`resyncmask`)              | a tool first seen in a re-sync is masked for new agents, not re-masked for already-masked ones |
  * | 35| hiddenTools public-name glob partial hit (`pmask`)       | denies only the matched tool, others visible and callable |
  * | 36| disabledTools exact public name / glob spellings         | matched tools never registered, others callable, counts logged |
+ * | 37| a load by one session (`scoped`)                         | no other session — existing or created later — sees the tools |
+ * | 38| a second session opts in, the first opts out              | each session's own view is independent; the generation survives |
+ * | 39| subagent / fork lineage                                  | a subagent of a holder inherits; a fork starts unexpanded    |
+ * | 40| the last holder leaves                                   | the generation is released for everyone                      |
+ * | 41| an eager server (no loader)                              | never masked: nothing could reveal it again                  |
+ * | 42| re-sync under per-session masks (`sessresync`)            | a newly discovered name is masked for non-holders too        |
  */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -88,7 +94,7 @@ const FORCED_TOOLS = [
   'mcp__forced__fail',
   'mcp__forced__structured',
 ]
-const HINT = "Call to load this MCP server's tools; call again to hide them."
+const HINT = "Call to load this MCP server's tools into this session; call again to hide them."
 
 // Per-run scratch dir for the fault-injection markers and observability logs;
 // removed when the suite exits.
@@ -344,6 +350,33 @@ ctx.plugin(plugin, {
       disabledTools: ['f*', 'mcp__dsuppglob__s*'],
       command: process.execPath,
       args: [FIXTURE],
+    },
+    scoped: {
+      description: 'Lazy multi-tool server used by the per-session visibility checks',
+      mode: 'lazy',
+      command: process.execPath,
+      args: [FIXTURE],
+      env: {
+        ECHO_LOG: file('scoped.log'),
+      },
+    },
+    sessresync: {
+      description: 'Per-session server whose re-sync introduces a name the masks must learn',
+      mode: 'lazy',
+      command: process.execPath,
+      args: [FIXTURE],
+      env: {
+        ECHO_LOG: file('sessresync.log'),
+      },
+    },
+    scoped2: {
+      description: 'Second lazy server for the mutual-isolation checks',
+      mode: 'lazy',
+      command: process.execPath,
+      args: [FIXTURE],
+      env: {
+        ECHO_LOG: file('scoped2.log'),
+      },
     },
   },
 })
@@ -1165,6 +1198,191 @@ await check(36, 'disabledTools exact public name and glob spellings never regist
     logLines.some((line) => line.includes('loaded 4 tool(s) from "dsuppglob"')),
     `missing the dsuppglob filtered count: ${JSON.stringify(logLines.slice(-10))}`,
   )
+})
+
+// ── per-session visibility (slice 04) ────────────────────────────────────────
+
+/**
+ * Mint one agent the way the harness does: a real scope under a live plugin
+ * context, announced on `agent/created` so the plugin reconciles that agent's
+ * masks before its first request. `header` supplies the session identity the
+ * plugin reads for its holder and lineage decisions.
+ */
+async function mintAgent(name, header = {}) {
+  const key = { id: name }
+  let scope
+  ctx.plugin({
+    name: `test-${name}`,
+    inject: ['tools'],
+    apply(mintCtx) {
+      scope = createScope(mintCtx, key)
+    },
+  })
+  await waitFor(() => scope !== undefined, `the ${name} agent scope`)
+  const agent = { id: name, session: { header: { id: name, isSeeded: false, ...header } }, ctx: scope.ctx }
+  ctx.emit('agent/created', { agent })
+  return { key, scope, agent, dispose: () => scope.dispose() }
+}
+
+/** Tear one minted agent down the way the harness does, disposal event included. */
+const disposeAgent = async (minted) => {
+  ctx.emit('agent/disposed', { agent: minted.agent })
+  await minted.scope.dispose()
+}
+
+await check(37, 'a load performed by one session expands no other session', async () => {
+  const other = await mintAgent('sess-other')
+  const holder = await mintAgent('sess-holder')
+  try {
+    assert.ok(
+      !visible(other.key).includes('mcp__scoped__echo'),
+      'precondition: the scoped server must not be loaded yet',
+    )
+    const result = await call('mcp_scoped', {}, holder.agent)
+    assert.equal(textOf(result), 'ok')
+    // Invariant 1 is untouched: the tools are still registered deployment-wide,
+    // and only the per-agent mask keeps them out of another session's view.
+    assert.ok(visible().includes('mcp__scoped__echo'), 'the tool must stay globally registered')
+    assert.ok(
+      visible(holder.key).includes('mcp__scoped__echo'),
+      'the session that called the loader must see the tools it loaded',
+    )
+    assert.ok(
+      !visible(other.key).includes('mcp__scoped__echo'),
+      'a session that never called the loader inherited another session disclosure',
+    )
+    assert.ok(visible(other.key).includes('mcp_scoped'), 'the loader itself must stay visible to every session')
+    // A session created after the load must start unexpanded too.
+    const later = await mintAgent('sess-later')
+    try {
+      assert.ok(
+        !visible(later.key).includes('mcp__scoped__echo'),
+        'a session created after the load started out expanded',
+      )
+      assert.ok(visible(later.key).includes('mcp_scoped'), 'the loader must stay visible to a new session')
+    } finally {
+      await disposeAgent(later)
+    }
+  } finally {
+    await disposeAgent(other)
+    await disposeAgent(holder)
+  }
+})
+
+await check(38, 'sessions toggle their own view without withdrawing another', async () => {
+  const first = await mintAgent('sess-first')
+  const second = await mintAgent('sess-second')
+  try {
+    await call('mcp_scoped2', {}, first.agent)
+    assert.ok(visible(first.key).includes('mcp__scoped2__echo'), 'the first session must see its own load')
+    assert.ok(!visible(second.key).includes('mcp__scoped2__echo'), 'the second session must start masked')
+    // The masked session can opt in itself; the generation is already registered,
+    // so this must not re-register or release anything.
+    const optedIn = await call('mcp_scoped2', {}, second.agent)
+    assert.equal(textOf(optedIn), 'ok')
+    assert.ok(visible(second.key).includes('mcp__scoped2__echo'), 'the opting-in session must see the tools')
+    assert.ok(visible(first.key).includes('mcp__scoped2__echo'), 'the first session must be unaffected')
+    // One session hiding its own view must not withdraw the other's.
+    const hidden = await call('mcp_scoped2', {}, first.agent)
+    assert.match(textOf(hidden), /tool\(s\) hidden/, `unexpected text: ${textOf(hidden)}`)
+    assert.ok(!visible(first.key).includes('mcp__scoped2__echo'), 'the toggling session must be masked again')
+    assert.ok(visible(second.key).includes('mcp__scoped2__echo'), 'another session lost tools it was still holding')
+    assert.ok(visible().includes('mcp__scoped2__echo'), 'the generation must survive while one holder remains')
+  } finally {
+    await disposeAgent(first)
+    await disposeAgent(second)
+  }
+})
+
+await check(39, 'a subagent of a holder inherits; a fork does not', async () => {
+  const holder = await mintAgent('lineage-holder')
+  try {
+    await call('mcp_scoped', {}, holder.agent)
+    assert.ok(visible(holder.key).includes('mcp__scoped__echo'), 'the holder must see its own load')
+    // A subagent is created through its parent's context: it inherits the
+    // disclosure without calling the loader itself.
+    const child = await mintAgent('lineage-child', {
+      origin: 'subagent',
+      parentSession: 'lineage-holder',
+      delegationDepth: 1,
+    })
+    try {
+      assert.ok(
+        visible(child.key).includes('mcp__scoped__echo'),
+        'a subagent of a holding session must inherit the loaded tools',
+      )
+    } finally {
+      await disposeAgent(child)
+    }
+    // A fork carries `parentSession` as seed lineage and no `origin`: it is a new
+    // session and must start unexpanded.
+    const fork = await mintAgent('lineage-fork', { parentSession: 'lineage-holder', isSeeded: true })
+    try {
+      assert.ok(
+        !visible(fork.key).includes('mcp__scoped__echo'),
+        'a forked session must not inherit another session disclosure',
+      )
+    } finally {
+      await disposeAgent(fork)
+    }
+  } finally {
+    await disposeAgent(holder)
+  }
+})
+
+await check(40, 'the last holder leaving releases the generation for everyone', async () => {
+  const holder = await mintAgent('release-holder')
+  await call('mcp_scoped', {}, holder.agent)
+  assert.ok(visible().includes('mcp__scoped__echo'), 'precondition: the server must be loaded')
+  // Disposing the only holder withdraws the disclosure everywhere, because a
+  // generation nobody holds would be visible to no session anyway.
+  await disposeAgent(holder)
+  await waitFor(() => !visible().includes('mcp__scoped__echo'), 'the released generation')
+  assert.ok(!visible().includes('mcp__scoped__die'), 'no tool of the released server may survive')
+})
+
+await check(41, 'an eager server with no loader is never masked', async () => {
+  // `forced` is mode: eager, so its loader was disposed at startup. Masking it
+  // would hide tools no session could reveal again.
+  const agent = await mintAgent('eager-agent')
+  try {
+    assert.ok(
+      visible(agent.key).includes('mcp__forced__echo'),
+      'an eager server must stay visible to every session',
+    )
+    const called = await call('mcp__forced__add', { a: 1, b: 2 }, agent.agent)
+    assert.equal(called.isError, false, textOf(called))
+    assert.equal(textOf(called), '3')
+  } finally {
+    await disposeAgent(agent)
+  }
+})
+
+await check(42, 'a re-sync extends the per-session mask to newly discovered names', async () => {
+  const holder = await mintAgent('resync-holder')
+  const other = await mintAgent('resync-other')
+  try {
+    await call('mcp_sessresync', {}, holder.agent)
+    assert.ok(visible(holder.key).includes('mcp__sessresync__echo'), 'the holder must see the first generation')
+    assert.ok(!visible(other.key).includes('mcp__sessresync__echo'), 'the other session must be masked')
+    assert.ok(!visible().includes('mcp__sessresync__new_tool'), 'precondition: new_tool does not exist yet')
+    // Grow the server: `new_tool` only ever exists after the re-sync, so a mask
+    // computed once at load time would miss it.
+    const added = await call('mcp__sessresync__add_tool', {})
+    assert.equal(added.isError, false, textOf(added))
+    await waitFor(() => visible().includes('mcp__sessresync__new_tool'), 'the sessresync re-sync')
+    assert.ok(
+      visible(holder.key).includes('mcp__sessresync__new_tool'),
+      'the holder must see the re-synced tool',
+    )
+    assert.ok(
+      !visible(other.key).includes('mcp__sessresync__new_tool'),
+      'a re-synced tool leaked past the per-session mask',
+    )
+  } finally {
+    await disposeAgent(holder)
+    await disposeAgent(other)
+  }
 })
 
 const failures = results.filter((entry) => entry.status === 'FAIL')

@@ -15,6 +15,17 @@
  * names that are not globally registered, so composition plugins that hide tools
  * per agent (e.g. inkstone-tool-hide) can only work against global
  * registrations.
+ *
+ * Visibility, however, is per session: registering globally means the global
+ * layer is what every agent's view inherits, so a load performed by one session
+ * used to be visible to every other session in the process (and to every session
+ * created afterwards) — the whole deployment paid for one session's disclosure.
+ * A loaded server is therefore masked by default for every agent that did not
+ * ask for it: the loader toggles the calling session into that server's
+ * `holders`, and only a holder (or a subagent working under one) sees the tools.
+ * A generation loaded with no holder at all — the agentless path — keeps the
+ * v0.5.0 deployment-wide behavior, and a server with no loader tool (eager) is
+ * never masked because nothing could ever reveal it again.
  */
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { ServerConnection, messageOf, validateServerConfig, type Logger } from './connection.js'
@@ -22,7 +33,8 @@ import { PRESET_PARAMETER_DESCRIPTION_CAP, descriptionOverridesFor } from './pre
 import type { DiscoveredTool, PluginConfig, ServerConfig } from './types.js'
 
 /** Appended to every loader tool description unless overridden by config. */
-const DEFAULT_LOADER_HINT = "Call to load this MCP server's tools; call again to hide them."
+const DEFAULT_LOADER_HINT =
+  "Call to load this MCP server's tools into this session; call again to hide them."
 
 /** Loader metadata: the plugin owns no service, but it must not apply before the registry. */
 export const name = 'tool-aggregator'
@@ -87,6 +99,20 @@ interface ToolRegistrar {
   register(definition: ToolDefinition): () => void
 }
 
+/**
+ * One loaded generation of a server's tools.
+ *
+ * `names` is the public tool names this generation registered, which is what the
+ * per-session default mask denies; keeping it beside the disposers means a mask
+ * never has to re-derive names from a stale discovery snapshot.
+ */
+interface Generation {
+  /** raw tool name -> that tool's registration disposer. */
+  disposers: Map<string, () => void>
+  /** Public tool names registered by this generation. */
+  names: string[]
+}
+
 export function apply(ctx: any, config: PluginConfig = {}): void {
   const serverConfigs: Record<string, ServerConfig> = config.servers ?? {}
   const loaderHint = config.loaderHint ?? DEFAULT_LOADER_HINT
@@ -143,9 +169,9 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
   /** server name -> loader tool registration disposer */
   const loaders = new Map<string, () => void>()
   /** server name -> raw tool name -> registration disposer (the live generation) */
-  const loaded = new Map<string, Map<string, () => void>>()
+  const loaded = new Map<string, Generation>()
   /** server name -> in-flight load, so the startup probe and a loader call cannot double-register */
-  const pending = new Map<string, Promise<Map<string, () => void>>>()
+  const pending = new Map<string, Promise<Generation>>()
   /** server name -> pending idle-disconnect timer (armed only while that server has no loaded tools) */
   const idleTimers = new Map<string, NodeJS.Timeout>()
   /** server name -> how many idle disconnects have fired for it (log counter) */
@@ -170,7 +196,7 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     clearIdleTimer(serverName)
     const idleMs = serverConfigs[serverName]?.idleDisconnectMs ?? 0
     if (idleMs <= 0) return
-    if ((loaded.get(serverName)?.size ?? 0) > 0) return
+    if ((loaded.get(serverName)?.disposers.size ?? 0) > 0) return
     const connection = connections.get(serverName)
     if (connection === undefined) return
     // Nothing to disconnect when no connection exists yet (never loaded).
@@ -179,7 +205,7 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
       idleTimers.delete(serverName)
       // A load may have raced the timer: never disconnect a server that has
       // tools again, and never disconnect mid-load.
-      if ((loaded.get(serverName)?.size ?? 0) > 0) return
+      if ((loaded.get(serverName)?.disposers.size ?? 0) > 0) return
       if (pending.has(serverName)) {
         reconcileIdleTimer(serverName)
         return
@@ -198,18 +224,43 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
 
   /**
    * server name -> deny mask (public tool names) for that server's *currently
-   * loaded* generation. Recomputed from the expanded `hiddenTools` rules
-   * whenever a generation registers (load, re-sync), so glob rules are matched
-   * against the discovered tool set at load time. Merged from the retired
+   * loaded* generation, derived from the expanded `hiddenTools` rules whenever a
+   * generation registers (load, re-sync), so glob rules are matched against the
+   * discovered tool set at load time. Merged from the retired
    * `inkstone-tool-hide` plugin: the mask is a per-agent `restrict()`, which
    * only filters inherited (global) tools — which is why this plugin registers
    * globally. The server's own loader tool is never part of the mask.
    */
-  const denyMasks = new Map<string, string[]>()
+  const hideMasks = new Map<string, string[]>()
   /** Servers whose loader-name hit by a hiddenTools glob already warned about. */
   const loaderHitWarned = new Set<string>()
-  /** agent -> servers whose deny mask that agent already carries (weak: no retention). */
-  const restricted = new WeakMap<object, Set<string>>()
+
+  /**
+   * server name -> session ids that toggled that server ON (slice 04).
+   *
+   * The loader is a per-session switch: a session that never called it must not
+   * inherit another session's disclosure, and a session created after a load must
+   * not start out expanded. A server with an empty holder set was loaded through
+   * the agentless path, which has no session to scope the disclosure to, and
+   * keeps the deployment-wide v0.5.0 behavior.
+   */
+  const holders = new Map<string, Set<string>>()
+  /**
+   * server name -> agent -> the deny mask that agent currently carries.
+   *
+   * Strong keys, not a WeakMap: a mask must be lifted and recomputed when the
+   * agent's holder status or the server's tool list changes, which needs
+   * iteration. Entries are dropped on `agent/disposed` and when a mask empties;
+   * the registration itself is owned by the agent's scope, so a disposed agent
+   * releases it independently of this bookkeeping.
+   */
+  const appliedMasks = new Map<string, Map<object, { deny: string[]; dispose: () => void }>>()
+  /**
+   * Live agents by session id, learned from `agent/created` and refreshed from
+   * the `agents` service when one is composed. Ancestor headers are read from
+   * here so a subagent's lineage resolves without holding the whole registry.
+   */
+  const liveAgents = new Map<string, unknown>()
 
   /**
    * Filter a server's discovered tools through its `disabledTools` rules
@@ -240,7 +291,7 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
   function refreshDenyMask(serverName: string, available: DiscoveredTool[]): void {
     const config = serverConfigs[serverName]
     if ((config.hiddenTools ?? []).length === 0) {
-      denyMasks.delete(serverName)
+      hideMasks.delete(serverName)
       return
     }
     const { deny, loaderHit } = expandToolRules(serverName, config, available)
@@ -251,41 +302,153 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
         `[tool-aggregator] server "${serverName}": a hiddenTools glob also covers its own loader tool "${loaderName}"; the loader is kept visible`,
       )
     }
-    if (deny.length === 0) denyMasks.delete(serverName)
-    else denyMasks.set(serverName, deny)
+    if (deny.length === 0) hideMasks.delete(serverName)
+    else hideMasks.set(serverName, deny)
   }
 
-  /** Apply every ready server's deny mask to one agent, once per server. */
-  function restrictAgent(agent: unknown): void {
-    if (typeof agent !== 'object' || agent === null) return
-    let done = restricted.get(agent)
-    if (done === undefined) {
-      done = new Set<string>()
-      restricted.set(agent, done)
+  /** The session id behind an agent-shaped value, when it carries one. */
+  function sessionIdOf(agent: unknown): string | undefined {
+    const shaped = agent as
+      | { id?: unknown; session?: { header?: { id?: unknown } } }
+      | undefined
+    const fromHeader = shaped?.session?.header?.id
+    if (typeof fromHeader === 'string') return fromHeader
+    return typeof shaped?.id === 'string' ? shaped.id : undefined
+  }
+
+  /** The session header behind an agent-shaped value, when it carries one. */
+  function headerOf(agent: unknown): { id?: string; origin?: string; parentSession?: string } | undefined {
+    return (agent as { session?: { header?: { id?: string; origin?: string; parentSession?: string } } } | undefined)
+      ?.session?.header
+  }
+
+  /**
+   * The session ids whose holder status governs `agent`, nearest first.
+   *
+   * A subagent is created through its parent's context and must inherit the
+   * parent's disclosure, so the walk follows `parentSession` while — and only
+   * while — each link is a `subagent` child. A fork carries `parentSession` as
+   * seed lineage and no `origin`, which deliberately stops the walk: a fork is a
+   * new session and must start unexpanded. Nodes whose agent is not live stop
+   * the walk at their own id, which still lets a directly-named holder answer.
+   */
+  function ancestryIds(agent: unknown): string[] {
+    const ids: string[] = []
+    const seen = new Set<string>()
+    let header = headerOf(agent)
+    if (header === undefined) {
+      // An agent carrying only an id cannot be walked upwards, but it can still
+      // be a holder in its own right.
+      const direct = sessionIdOf(agent)
+      return direct === undefined ? ids : [direct]
     }
-    for (const [serverName, names] of denyMasks) {
-      if (done.has(serverName)) continue
-      if ((loaded.get(serverName)?.size ?? 0) === 0) continue
-      const agentTools = (agent as { ctx?: { tools?: { restrict?: (filter: { deny: string[] }) => unknown } } })
-        .ctx?.tools
-      if (agentTools?.restrict === undefined) continue
+    while (typeof header?.id === 'string' && !seen.has(header.id)) {
+      seen.add(header.id)
+      ids.push(header.id)
+      if (header.origin !== 'subagent' || header.parentSession === undefined) break
+      header = headerOf(liveAgents.get(header.parentSession)) ?? { id: header.parentSession }
+    }
+    return ids
+  }
+
+  /** Whether `agent` is a holder of `serverName`, or works under one. */
+  function isHolder(serverName: string, agent: unknown): boolean {
+    const set = holders.get(serverName)
+    if (set === undefined || set.size === 0) return false
+    for (const id of ancestryIds(agent)) if (set.has(id)) return true
+    return false
+  }
+
+  /**
+   * The deny mask one agent must carry for one loaded server.
+   *
+   * Empty when the server is not loaded, and empty for every agent when the
+   * generation has no holder (the agentless path, which keeps the deployment-wide
+   * v0.5.0 behavior) or when the server has no loader tool left to reveal it
+   * again — an eager server masked for everyone would be unreachable.
+   */
+  function denyFor(serverName: string, agent: unknown): string[] {
+    const generation = loaded.get(serverName)
+    if (generation === undefined || generation.names.length === 0) return []
+    const hidden = hideMasks.get(serverName) ?? []
+    if (!loaders.has(serverName)) return hidden
+    const set = holders.get(serverName)
+    if (set === undefined || set.size === 0) return hidden
+    if (isHolder(serverName, agent)) return hidden
+    const deny = new Set(hidden)
+    for (const name of generation.names) deny.add(name)
+    return [...deny]
+  }
+
+  /** Whether two deny lists carry the same names. */
+  function sameDeny(left: string[] | undefined, right: string[]): boolean {
+    if (left === undefined || left.length !== right.length) return false
+    const have = new Set(left)
+    for (const name of right) if (!have.has(name)) return false
+    return true
+  }
+
+  /** Reconcile one agent's deny masks with the current holders and generations. */
+  function syncAgent(agent: unknown): void {
+    if (typeof agent !== 'object' || agent === null) return
+    const agentTools = (agent as { ctx?: { tools?: { restrict?: (filter: { deny: string[] }) => () => void } } })
+      .ctx?.tools
+    if (agentTools?.restrict === undefined) return
+    for (const serverName of new Set([...loaded.keys(), ...appliedMasks.keys()])) {
+      const desired = denyFor(serverName, agent)
+      let map = appliedMasks.get(serverName)
+      const current = map?.get(agent)
+      if (sameDeny(current?.deny, desired)) continue
+      if (current !== undefined && map !== undefined) {
+        map.delete(agent)
+        try {
+          current.dispose()
+        } catch {
+          // Lifting a mask is best effort; the agent's scope owns it too.
+        }
+      }
+      if (desired.length === 0) continue
       try {
-        agentTools.restrict({ deny: names })
-        done.add(serverName)
-        logger.info(`[tool-aggregator] hid ${names.length} tool(s) of "${serverName}" from one agent`)
+        const dispose = agentTools.restrict({ deny: desired })
+        map ??= new Map<object, { deny: string[]; dispose: () => void }>()
+        appliedMasks.set(serverName, map)
+        map.set(agent, { deny: desired, dispose })
       } catch (error) {
-        logger.warn(
-          `[tool-aggregator] could not hide tools of "${serverName}" from an agent: ${messageOf(error)}`,
-        )
+        logger.warn(`[tool-aggregator] could not mask tools of "${serverName}" for an agent: ${messageOf(error)}`)
       }
     }
   }
 
-  /** Apply the masks to the calling agent and every agent the harness knows about. */
-  function restrictAllAgents(caller?: unknown): void {
-    restrictAgent(caller)
+  /** Reconcile every agent the harness knows about, plus the caller. */
+  function syncAgents(caller?: unknown): void {
+    rememberAgents()
+    syncAgent(caller)
+    for (const agent of liveAgents.values()) syncAgent(agent)
+  }
+
+  /** Refresh the live-agent map from the `agents` service when it is composed. */
+  function rememberAgents(): void {
     const agents = ctx.get('agents') as { list?: () => unknown[] } | undefined
-    for (const agent of agents?.list?.() ?? []) restrictAgent(agent)
+    for (const agent of agents?.list?.() ?? []) {
+      const id = sessionIdOf(agent)
+      if (id !== undefined) liveAgents.set(id, agent)
+    }
+  }
+
+  /** Forget one agent entirely: its ids, its holder entries and its masks. */
+  function forgetAgent(agent: unknown): void {
+    const id = sessionIdOf(agent)
+    if (id !== undefined) liveAgents.delete(id)
+    for (const map of appliedMasks.values()) {
+      const entry = map.get(agent as object)
+      if (entry === undefined) continue
+      map.delete(agent as object)
+      try {
+        entry.dispose()
+      } catch {
+        // The agent's scope teardown owns the registration as well.
+      }
+    }
   }
 
   /** Deep-copy a parameter schema, truncating every long `description`. */
@@ -373,12 +536,16 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
   }
 
   /** Register one generation, rolling back to zero on the first failure. */
-  function registerGeneration(connection: ServerConnection, discovered: DiscoveredTool[]): Map<string, () => void> {
-    const next = new Map<string, () => void>()
+  function registerGeneration(connection: ServerConnection, discovered: DiscoveredTool[]): Generation {
+    const disposers = new Map<string, () => void>()
+    const names: string[] = []
     try {
-      for (const tool of discovered) next.set(tool.rawName, registry.register(definitionFor(connection, tool)))
+      for (const tool of discovered) {
+        disposers.set(tool.rawName, registry.register(definitionFor(connection, tool)))
+        names.push(tool.publicName)
+      }
     } catch (error) {
-      for (const dispose of next.values()) {
+      for (const dispose of disposers.values()) {
         try {
           dispose()
         } catch {
@@ -387,7 +554,7 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
       }
       throw error
     }
-    return next
+    return { disposers, names }
   }
 
   /**
@@ -431,9 +598,9 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
   }
 
   /** Load one server's tools, deduplicating concurrent attempts. */
-  function loadServer(connection: ServerConnection, caller?: unknown): Promise<Map<string, () => void>> {
+  function loadServer(connection: ServerConnection, caller?: unknown): Promise<Generation> {
     const existing = loaded.get(connection.name)
-    if (existing !== undefined && existing.size > 0) return Promise.resolve(existing)
+    if (existing !== undefined && existing.disposers.size > 0) return Promise.resolve(existing)
     const inflight = pending.get(connection.name)
     if (inflight !== undefined) return inflight
     const attempt = (async () => {
@@ -451,15 +618,15 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
           logger.info(
             `[tool-aggregator] discarded a stale discovery for "${connection.name}" (a newer one already applied)`,
           )
-          return new Map<string, () => void>()
+          return { disposers: new Map<string, () => void>(), names: [] }
         }
         if (available.length === 0) {
           // No usable tools: either the server exposes none or `disabledTools`
           // suppressed them all. Both end as an empty generation.
-          const empty = new Map<string, () => void>()
+          const empty: Generation = { disposers: new Map<string, () => void>(), names: [] }
           commitDiscovery(connection.name, version)
           loaded.set(connection.name, empty)
-          denyMasks.delete(connection.name)
+          hideMasks.delete(connection.name)
           clearIdleTimer(connection.name)
           if (discovered.length > 0) {
             logger.info(
@@ -473,8 +640,8 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
         loaded.set(connection.name, generation)
         refreshDenyMask(connection.name, available)
         clearIdleTimer(connection.name)
-        restrictAllAgents(caller)
-        logger.info(`[tool-aggregator] loaded ${generation.size} tool(s) from "${connection.name}"`)
+        syncAgents(caller)
+        logger.info(`[tool-aggregator] loaded ${generation.disposers.size} tool(s) from "${connection.name}"`)
         return generation
       } catch (error) {
         // A failed load may still have left the connection established while no
@@ -489,23 +656,31 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     return attempt
   }
 
-  /** Hide a loaded server's tools again; returns how many registrations were released. */
+  /**
+   * Hide a loaded server's tools again; returns how many registrations were released.
+   *
+   * Releasing the generation also empties the holder set and reconciles every
+   * mask: once nothing is registered, `denyFor` returns the hiddenTools mask
+   * alone, so the per-session mask is lifted everywhere in the same pass.
+   */
   function unloadServer(serverName: string): number {
     const generation = loaded.get(serverName)
     if (generation === undefined) return 0
     loaded.delete(serverName)
-    denyMasks.delete(serverName)
-    for (const dispose of generation.values()) {
+    hideMasks.delete(serverName)
+    holders.delete(serverName)
+    for (const dispose of generation.disposers.values()) {
       try {
         dispose()
       } catch (error) {
         logger.warn(`[tool-aggregator] disposing a tool of "${serverName}" failed: ${messageOf(error)}`)
       }
     }
+    syncAgents()
     // An unloaded server is exactly the idle-disconnect candidate: arm the
     // timer when `idleDisconnectMs` opts in (default 0 keeps it warm).
     reconcileIdleTimer(serverName)
-    return generation.size
+    return generation.disposers.size
   }
 
   /** Register the model-facing loader tool for one server. */
@@ -530,12 +705,48 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
         },
       },
       async execute(_args: unknown, exec: ToolRunContext) {
+        const sessionId = sessionIdOf(exec.agent)
+        const set = holders.get(connection.name)
         const current = loaded.get(connection.name)
-        if (current !== undefined && current.size > 0) {
-          const removed = unloadServer(connection.name)
-          return { text: `ok (${removed} tool(s) hidden)` }
+        // A session that already holds this server toggles it off for itself.
+        // The generation is only released once the last holder drops it, so one
+        // session hiding its own tools never withdraws another's.
+        if (sessionId !== undefined && set?.has(sessionId) === true) {
+          set.delete(sessionId)
+          const hidden = current?.names.length ?? 0
+          if (set.size === 0) {
+            const removed = unloadServer(connection.name)
+            return { text: `ok (${removed} tool(s) hidden)` }
+          }
+          syncAgents()
+          return { text: `ok (${hidden} tool(s) hidden)` }
         }
-        await loadServer(connection, exec.agent)
+        // An agentless call has no session to scope the disclosure to: keep the
+        // v0.5.0 deployment-wide toggle, which leaves the holder set empty.
+        if (sessionId === undefined) {
+          if (current !== undefined && current.disposers.size > 0) {
+            const removed = unloadServer(connection.name)
+            return { text: `ok (${removed} tool(s) hidden)` }
+          }
+          await loadServer(connection, exec.agent)
+          return { text: 'ok' }
+        }
+        let owned = holders.get(connection.name)
+        if (owned === undefined) {
+          owned = new Set<string>()
+          holders.set(connection.name, owned)
+        }
+        owned.add(sessionId)
+        try {
+          await loadServer(connection, exec.agent)
+        } catch (error) {
+          // A failed load must not leave this session holding a server that
+          // registered nothing: the next call would then read as "hide".
+          owned.delete(sessionId)
+          if (owned.size === 0) holders.delete(connection.name)
+          throw error
+        }
+        syncAgents(exec.agent)
         return { text: 'ok' }
       },
     }
@@ -551,6 +762,10 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     } catch (error) {
       logger.warn(`[tool-aggregator] disposing the loader of "${serverName}" failed: ${messageOf(error)}`)
     }
+    // A server with no loader has no way back: masking it would hide tools no
+    // session could ever reveal again, so dropping the loader also drops the
+    // per-session mask the eager registration made unnecessary.
+    syncAgents()
   }
 
   /**
@@ -567,8 +782,8 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
    */
   function swapGeneration(connection: ServerConnection, discovered: DiscoveredTool[]): boolean {
     const previous = loaded.get(connection.name)
-    if (previous === undefined || previous.size === 0) return false
-    for (const dispose of previous.values()) {
+    if (previous === undefined || previous.disposers.size === 0) return false
+    for (const dispose of previous.disposers.values()) {
       try {
         dispose()
       } catch (error) {
@@ -582,7 +797,8 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
       return true
     } catch (error) {
       loaded.delete(connection.name)
-      denyMasks.delete(connection.name)
+      hideMasks.delete(connection.name)
+      holders.delete(connection.name)
       logger.error(
         `[tool-aggregator] re-sync of "${connection.name}" could not re-register its tools: ${messageOf(error)}; that server is now unloaded`,
       )
@@ -619,6 +835,10 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     }
     if (swapGeneration(connection, available)) {
       commitDiscovery(connection.name, version)
+      // A re-sync can introduce names that no per-session mask has denied yet,
+      // so the masks are recomputed after every landing rather than only for
+      // agents created later.
+      syncAgents()
       logger.info(`[tool-aggregator] re-synced "${connection.name}" (${available.length} tools)`)
     }
     // Normally a disarm/no-op (a re-sync only swaps an already-loaded
@@ -675,7 +895,9 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
       try {
         const generation = await loadServer(connection)
         disposeLoader(connection.name)
-        logger.info(`[tool-aggregator] "${connection.name}": ${generation.size} tool(s) registered eagerly`)
+        logger.info(
+          `[tool-aggregator] "${connection.name}": ${generation.disposers.size} tool(s) registered eagerly`,
+        )
       } catch (error) {
         logger.error(
           `[tool-aggregator] eager registration of "${connection.name}" failed: ${messageOf(error)}; keeping its loader tool`,
@@ -692,8 +914,31 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
 
   for (const serverName of Object.keys(serverConfigs)) registerLoader(serverName)
 
-  // An agent created after a masked server was loaded still needs its deny mask.
-  ctx.on?.('agent/created', (payload: { agent?: unknown } | undefined) => restrictAgent(payload?.agent))
+  // A server loaded before an agent existed must still be masked for that agent,
+  // and an agent that turns out to be a subagent of a holder must stay unmasked:
+  // both are decided here, synchronously, before the agent's first request.
+  ctx.on?.('agent/created', (payload: { agent?: unknown } | undefined) => {
+    const agent = payload?.agent
+    const id = sessionIdOf(agent)
+    if (id !== undefined) liveAgents.set(id, agent)
+    syncAgent(agent)
+  })
+  // A disposed session must not keep holding a server open: its holder entries
+  // are dropped, and a server left with no holder is released like any unload.
+  ctx.on?.('agent/disposed', (payload: { agent?: unknown } | undefined) => {
+    const agent = payload?.agent
+    forgetAgent(agent)
+    const id = sessionIdOf(agent)
+    if (id === undefined) return
+    for (const [serverName, set] of holders) {
+      if (!set.delete(id)) continue
+      if (set.size === 0) {
+        unloadServer(serverName)
+        continue
+      }
+      syncAgents()
+    }
+  })
 
   ctx.effect(() => () => {
     for (const dispose of loaders.values()) {
@@ -705,7 +950,7 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     }
     loaders.clear()
     for (const generation of loaded.values()) {
-      for (const dispose of generation.values()) {
+      for (const dispose of generation.disposers.values()) {
         try {
           dispose()
         } catch {
@@ -717,6 +962,9 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     pending.clear()
     discoveryVersions.clear()
     landedVersions.clear()
+    holders.clear()
+    appliedMasks.clear()
+    liveAgents.clear()
     for (const timer of idleTimers.values()) clearTimeout(timer)
     idleTimers.clear()
     idleDisconnectCount.clear()

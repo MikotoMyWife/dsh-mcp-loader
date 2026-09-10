@@ -4,7 +4,9 @@ Lazy-loading MCP tools for [DeepSeek Harness](https://github.com/deepseek-ai/dee
 each multi-tool MCP server is represented by **one loader tool** (default `mcp_<server>`), and a server's real
 tools enter the model context only after the loader is called. With many MCP servers installed, this removes the
 fixed cost of every tool schema being present in every request — and keeps the visible tool list small enough
-that the model picks the right tool.
+that the model picks the right tool. **A load is per session**: the session that called the loader (and its
+subagents) sees the tools, every other session in the process — including sessions created afterwards — keeps
+seeing just the loader.
 
 ## How it works
 
@@ -17,9 +19,13 @@ Initial tool list:   mcp_notes, mcp_browser, mcp_desktop, ...        (one loader
    ↓ a third call loads them again
 ```
 
-The loader is a **toggle**: call once to load, call again to hide, call a third time to load again —
-no separate "unload tool" occupies a slot. Single-tool servers (e.g. a lone `codegraph_explore`) are detected
-at startup and stay resident without a loader.
+The loader is a **toggle**, scoped to the session that calls it: call once to load, call again to hide, call a
+third time to load again — no separate "unload tool" occupies a slot. A second session toggling the same server
+has its own state: it never inherits the first session's disclosure, and hiding in one session never withdraws
+the tools from another. The underlying generation is released only once its last holder drops it. Servers with
+≤ `singleToolThreshold` tools are detected at startup and stay resident without a loader — and because nothing
+could ever reveal them again, they are never masked per session (`singleToolThreshold: 0` gives every server a
+loader, so every server is per-session).
 
 ### Registration model
 
@@ -31,10 +37,18 @@ at startup and stay resident without a loader.
 - Registration is deployment-wide (global), consistent with the official `dsh-mcp-client`, because
   `ctx.tools.restrict()` only filters inherited tools and rejects names that are not globally registered —
   per-agent hiding (`hiddenTools`) is built on top of global registration.
+- Visibility is per session. Registering globally puts the tools in the layer every agent inherits, so a load
+  that no session scoped would leak into every other session; instead the loader records the calling session as
+  a *holder*, and every agent that is not a holder (nor a subagent of one) receives a `restrict({ deny })` mask
+  over that generation's public names. A generation loaded with no holder at all — a call with no agent, e.g. a
+  test or a script driving `ctx.tools.execute` — keeps the deployment-wide v0.5.0 behavior.
+  Subagents inherit: the walk follows `parentSession` while the child is a `subagent`, and deliberately stops at
+  a fork (`isSeeded`, no `origin`), which is a new session and starts unexpanded.
 
 ## Features
 
-- **Per-server loader toggle** — load, hide, reload, with a visible result message (`ok`, `ok (N tool(s) hidden)`).
+- **Per-server loader toggle** — load, hide, reload, with a visible result message (`ok`, `ok (N tool(s) hidden)`),
+  and per session: one session's load is invisible to every other session (and its subagents inherit it).
 - **Modes** — `auto` (probe once at startup), `lazy` (always behind a loader, never probed), `eager` (always resident, no loader).
 - **`hiddenTools`** — mask specific tools per agent after a server loads (`restrict({ deny })`), for every existing
   agent and for agents created later. Entries are rules — exact raw names (`ping`), exact public names
@@ -111,7 +125,7 @@ Then register the plugin in your profile (id `mcp-loader`, package `dsh-mcp-load
 | `servers.<n>.discoveryTimeoutMs` | `60000` | Discovery deadline for one real pagination; a timeout fails naming `timeout` and drops the connection so a hung server never blocks later calls |
 | `connectTimeoutMs` | `30000` | Connection handshake timeout |
 | `singleToolThreshold` | `1` | `auto` mode: servers with ≤ this many tools stay resident |
-| `loaderHint` | `Call to load this MCP server's tools; call again to hide them.` | Appended to every loader description |
+| `loaderHint` | `Call to load this MCP server's tools into this session; call again to hide them.` | Appended to every loader description |
 | `probeAtStartup` | `true` | Probe `auto`/`eager` servers at startup (`lazy` never probed) |
 
 ## Hiding vs disabling tools
@@ -131,14 +145,17 @@ their v0.5.0 behavior unchanged.
 | Configuration | Mechanism | Scope | Takes effect |
 |---|---|---|---|
 | Loader called twice / `mode: lazy` never loaded | Registry removal (unload / not registered) | All agents | On call |
+| Loaded without holding the loader (default) | Visibility removal — `restrict({ deny })` per agent, lifted when the session itself opts in | Non-holder sessions only | After load, applied per agent |
 | `disabledTools` | Registry removal — matched tools are filtered out **before** registration | All agents (globally banned) | On load / re-sync |
 | `hiddenTools` | Visibility removal — `restrict({ deny })` per agent | Each agent (per-agent mask) | After load, applied per agent |
 
 The three axes are independent: being in the registry ≠ being visible ≠ being callable. `disabledTools` is the
-registry axis (a tool that is never registered is unreachable), `hiddenTools` stays the visibility axis (tools stay
-globally registered, only masked per agent). There is deliberately **no execution axis**: this plugin adds no
-`pre-execute` deny listener — a tool that is registered and visible is callable. (An execution-axis deny would only
-be worth adding if a future mode keeps tools registered while projecting them away.)
+registry axis (a tool that is never registered is unreachable), while the per-session default mask and
+`hiddenTools` stay on the visibility axis (tools stay globally registered, only masked per agent). The two masks
+are merged per agent, so a server can be both hidden by configuration and unheld by the agent in question.
+There is deliberately **no execution axis**: this plugin adds no `pre-execute` deny listener — a tool that is
+registered and visible is callable. (An execution-axis deny would only be worth adding if a future mode keeps
+tools registered while projecting them away.)
 
 **Lockout protection.** A server's own loader tool can never be hidden or disabled by its own rules:
 

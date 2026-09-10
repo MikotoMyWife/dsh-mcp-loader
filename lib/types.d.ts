@@ -144,7 +144,9 @@ export interface PluginConfig {
     /**
      * In `auto` mode, a server exposing at most this many tools is registered
      * eagerly instead of getting a loader tool. Defaults to 1, so a single-tool
-     * MCP is simply always available.
+     * MCP is simply always available. `0` gives every server a loader, which is
+     * what makes every server per-session: an eager server keeps no loader, so
+     * masking it per session would hide tools no session could reveal again.
      */
     singleToolThreshold?: number;
     /** Sentence appended to every loader tool description. */
