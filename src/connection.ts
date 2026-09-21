@@ -50,6 +50,8 @@ export const DEFAULT_MAX_TOOLS_PER_SERVER = 500
 export const DEFAULT_DISCOVERY_TIMEOUT_MS = 60_000
 /** Default deadline for confirming that a transport really closed. */
 export const DEFAULT_CLOSE_TIMEOUT_MS = 5_000
+/** Default ceiling for one server's MCP instructions, in UTF-8 bytes. */
+export const DEFAULT_MAX_INSTRUCTION_BYTES = 32_768
 
 /** Which discovery hard cap was hit. */
 export type DiscoveryLimitReason = 'pages' | 'tools' | 'timeout'
@@ -94,6 +96,23 @@ export class UnconfirmedCloseError extends Error {
 }
 
 /**
+ * A server's MCP instructions exceeded `maxInstructionBytes`.
+ *
+ * Deterministic, so never retried: a server that sends an over-long instruction
+ * block will send it again. Surfacing the load failure (instead of truncating)
+ * follows the plugin's cap discipline — a silent cut would hand the model a
+ * half-sentence and hide the operator's missing configuration.
+ */
+export class InstructionLimitError extends Error {
+  constructor(serverName: string, limit: number, actual: number) {
+    super(
+      `MCP server "${serverName}" sent ${actual} bytes of instructions, over the maxInstructionBytes limit of ${limit} bytes`,
+    )
+    this.name = 'InstructionLimitError'
+  }
+}
+
+/**
  * Whether a failed connect or discovery is worth retrying.
  *
  * Only transient establish/transport/timeout failures qualify. The v2 client
@@ -112,6 +131,7 @@ export class UnconfirmedCloseError extends Error {
  */
 export function isRetryable(error: unknown): boolean {
   if (error instanceof DiscoveryLimitError) return false
+  if (error instanceof InstructionLimitError) return false
   if (error instanceof UnconfirmedCloseError) return false
   if (error instanceof SdkError) {
     return error.code === SdkErrorCode.ConnectionClosed || error.code === SdkErrorCode.RequestTimeout
@@ -231,7 +251,7 @@ export function validateServerConfig(name: string, config: ServerConfig): string
       problems.push(`"${field}" must be a non-negative integer`)
     }
   }
-  for (const field of ['maxToolListPages', 'maxToolsPerServer', 'discoveryTimeoutMs', 'closeTimeoutMs'] as const) {
+  for (const field of ['maxToolListPages', 'maxToolsPerServer', 'discoveryTimeoutMs', 'closeTimeoutMs', 'maxInstructionBytes'] as const) {
     const value = config[field]
     if (value !== undefined && (!Number.isInteger(value) || value <= 0)) {
       problems.push(`"${field}" must be a positive integer`)
@@ -305,6 +325,9 @@ export class ServerConnection {
   #closureUnconfirmed = false
   /** Whether the "no tools capability" notice was already logged for this client. */
   #noToolsCapabilityLogged = false
+  #maxInstructionBytes: number
+  /** The connected server's own instructions, trimmed; `undefined` when it sent none. */
+  #instructions: string | undefined
 
   constructor(name: string, config: ServerConfig, logger: Logger, options: ServerConnectionOptions = {}) {
     this.name = name
@@ -319,6 +342,7 @@ export class ServerConnection {
     this.#maxToolsPerServer = config.maxToolsPerServer ?? DEFAULT_MAX_TOOLS_PER_SERVER
     this.#discoveryTimeoutMs = config.discoveryTimeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS
     this.#closeTimeoutMs = config.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS
+    this.#maxInstructionBytes = config.maxInstructionBytes ?? DEFAULT_MAX_INSTRUCTION_BYTES
   }
 
   /**
@@ -468,6 +492,20 @@ export class ServerConnection {
     } catch (error) {
       await this.#closeGeneration(client, 'failed connect')
       throw new Error(`could not connect to MCP server "${this.name}": ${messageOf(error)}`)
+    }
+    // The server's own instructions arrive with the handshake. Enforce the byte
+    // ceiling here, before the connection is published, so an over-long block
+    // fails this load instead of quietly entering a model-facing result.
+    const instructions = client.getInstructions()?.trimEnd()
+    if (instructions !== undefined && instructions.length > 0) {
+      const bytes = Buffer.byteLength(instructions, 'utf8')
+      if (bytes > this.#maxInstructionBytes) {
+        await this.#closeGeneration(client, 'over-long instructions')
+        throw new InstructionLimitError(this.name, this.#maxInstructionBytes, bytes)
+      }
+      this.#instructions = instructions
+    } else {
+      this.#instructions = undefined
     }
     this.#client = client
     const rebuilt = this.#dropped || n > 0
@@ -639,6 +677,15 @@ export class ServerConnection {
   /** Connection state without triggering a connection. */
   status(): ConnectionStatus {
     return { connected: this.#client !== undefined, discovered: this.#tools?.length }
+  }
+
+  /**
+   * The connected server's MCP instructions, or `undefined` when it sent none —
+   * or when no client is live, so a dropped connection never reports a stale
+   * instruction block.
+   */
+  instructions(): string | undefined {
+    return this.#client === undefined ? undefined : this.#instructions
   }
 
   /**

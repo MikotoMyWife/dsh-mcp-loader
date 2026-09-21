@@ -712,6 +712,23 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     return generation.disposers.size
   }
 
+  /**
+   * What the loader answers after a successful load: `ok`, plus the server's own
+   * MCP instructions when it sent any.
+   *
+   * The instructions belong in the result rather than the loader description: a
+   * description is assembled into every request for as long as the loader
+   * exists, while a result is read once, at the moment the session actually
+   * expands that server — which is also when they first apply. The block is
+   * bounded by `maxInstructionBytes` at connect time, so it cannot grow without
+   * the operator seeing a named failure.
+   */
+  function loadResultText(connection: ServerConnection): string {
+    const instructions = connection.instructions()
+    if (instructions === undefined || instructions.length === 0) return 'ok'
+    return `ok\n\n### MCP server: ${connection.name}\n\n${instructions}`
+  }
+
   /** Register the model-facing loader tool for one server. */
   function registerLoader(serverName: string): void {
     const connection = connections.get(serverName) as ServerConnection
@@ -758,7 +775,7 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
             return { text: `ok (${removed} tool(s) hidden)` }
           }
           await loadServer(connection, exec.agent)
-          return { text: 'ok' }
+          return { text: loadResultText(connection) }
         }
         let owned = holders.get(connection.name)
         if (owned === undefined) {
@@ -776,7 +793,7 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
           throw error
         }
         syncAgents(exec.agent)
-        return { text: 'ok' }
+        return { text: loadResultText(connection) }
       },
     }
     loaders.set(serverName, registry.register(definition))

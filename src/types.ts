@@ -144,6 +144,13 @@ export interface ServerConfig {
    * an overlapping one. Defaults to 5_000.
    */
   closeTimeoutMs?: number
+  /**
+   * Ceiling for this server's own MCP instructions, in UTF-8 bytes. An
+   * instruction block over the ceiling fails the load with an
+   * `InstructionLimitError` naming this server, the limit and the actual size —
+   * never truncated, and never retried. Defaults to 32_768.
+   */
+  maxInstructionBytes?: number
 }
 
 /** Plugin config. */

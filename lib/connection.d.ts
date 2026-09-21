@@ -18,6 +18,8 @@ export declare const DEFAULT_MAX_TOOLS_PER_SERVER = 500;
 export declare const DEFAULT_DISCOVERY_TIMEOUT_MS = 60000;
 /** Default deadline for confirming that a transport really closed. */
 export declare const DEFAULT_CLOSE_TIMEOUT_MS = 5000;
+/** Default ceiling for one server's MCP instructions, in UTF-8 bytes. */
+export declare const DEFAULT_MAX_INSTRUCTION_BYTES = 32768;
 /** Which discovery hard cap was hit. */
 export type DiscoveryLimitReason = 'pages' | 'tools' | 'timeout';
 /**
@@ -40,6 +42,17 @@ export declare class DiscoveryLimitError extends Error {
  */
 export declare class UnconfirmedCloseError extends Error {
     constructor(serverName: string);
+}
+/**
+ * A server's MCP instructions exceeded `maxInstructionBytes`.
+ *
+ * Deterministic, so never retried: a server that sends an over-long instruction
+ * block will send it again. Surfacing the load failure (instead of truncating)
+ * follows the plugin's cap discipline — a silent cut would hand the model a
+ * half-sentence and hide the operator's missing configuration.
+ */
+export declare class InstructionLimitError extends Error {
+    constructor(serverName: string, limit: number, actual: number);
 }
 /**
  * Whether a failed connect or discovery is worth retrying.
@@ -129,6 +142,12 @@ export declare class ServerConnection {
     onToolsChanged(listener: () => void): void;
     /** Connection state without triggering a connection. */
     status(): ConnectionStatus;
+    /**
+     * The connected server's MCP instructions, or `undefined` when it sent none —
+     * or when no client is live, so a dropped connection never reports a stale
+     * instruction block.
+     */
+    instructions(): string | undefined;
     /**
      * Soft disconnect: close the current client (and any in-flight connect) and
      * drop the cached state, but keep this connection reusable.

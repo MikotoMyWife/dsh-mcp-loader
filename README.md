@@ -60,6 +60,10 @@ loader, so every server is per-session).
 - **Description engineering** — per-server `description`, `descriptionPreset`, per-tool `toolDescriptions`
   overrides, and parameter-description truncation (`maxParameterDescriptionChars`), so the model-facing text
   says what the tool does and when to use it.
+- **Server instructions** — when a server sends MCP `instructions`, the load result carries them attributed as
+  `### MCP server: <name>`, so the model reads them at the moment the session expands that server. They live in
+  the result rather than in the loader description: a description would cost those tokens in every request for as
+  long as the loader exists. `maxInstructionBytes` bounds the block and fails the load when a server exceeds it.
 - **Resilience** — atomic registration (any failure rolls the server back to zero tools), shared concurrent
   attempts, `list_changed` resync (full-generation replace), raw `tools/call` (skips outputSchema validation of
   `structuredContent`, same as the official client), transport-failure discard-and-reconnect on next call.
@@ -124,6 +128,7 @@ Then register the plugin in your profile (id `mcp-loader`, package `dsh-mcp-load
 | `servers.<n>.toolDescriptions` | — | Per-tool description overrides |
 | `servers.<n>.descriptionPreset` | — | Built-in description tables (`desktop-touch`) |
 | `servers.<n>.maxParameterDescriptionChars` | `0` | Truncate parameter descriptions (preset may imply one) |
+| `servers.<n>.maxInstructionBytes` | `32768` | Ceiling for the server's own MCP `instructions`; over it the load fails naming this server, the limit and the actual size (never truncated, never retried) |
 | `servers.<n>.transport` | `stdio` | `stdio` or `streamable-http` |
 | `servers.<n>.command`/`args`/`env`/`cwd` | — | stdio process to spawn; `env` merges over the scrubbed parent environment (credential-shaped keys and `DSH_*` are withheld, proxies and `NPM_CONFIG_*` are kept) |
 | `servers.<n>.url`/`headers` | — | streamable-http endpoint and extra headers |

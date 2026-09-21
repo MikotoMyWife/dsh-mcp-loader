@@ -88,6 +88,7 @@ const PAGINATED = path.join(here, 'fixtures', 'paginated-server.mjs')
 const ENV_SERVER = path.join(here, 'fixtures', 'env-server.mjs')
 const ODD_RESULT = path.join(here, 'fixtures', 'odd-result-server.mjs')
 const NO_TOOLS = path.join(here, 'fixtures', 'no-tools-server.mjs')
+const INSTRUCTIONS = path.join(here, 'fixtures', 'instructions-server.mjs')
 const FIXTURE_TOOLS = [
   'mcp__fixture__add',
   'mcp__fixture__add_tool',
@@ -1654,6 +1655,88 @@ await check(48, 'a server without the tools capability loads empty and is never 
       'the empty-catalogue disposition must be logged, not silent',
     )
     assert.equal(countLines('notools.log', 'list'), 0, 'the plugin must not ask such a server for a tool list')
+  } finally {
+    await isolated.fiber.dispose()
+  }
+})
+
+await check(49, "the server's own MCP instructions surface in the load result", async () => {
+  const isolated = new Context()
+  isolated.plugin(SystemPrompt)
+  isolated.plugin(ToolRuntime, {})
+  await waitFor(() => isolated.tools !== undefined, 'the isolated tools service')
+  isolated.plugin(plugin, {
+    servers: {
+      instructionssrv: {
+        description: 'Server that ships instructions',
+        mode: 'lazy',
+        command: process.execPath,
+        args: [INSTRUCTIONS],
+      },
+    },
+  })
+  try {
+    await waitFor(
+      () => isolated.tools.schemas().some((entry) => entry.name === 'mcp_instructionssrv'),
+      'the instructions loader',
+    )
+    const loaded = await isolated.tools.execute({
+      callId: 'instr-load',
+      name: 'mcp_instructionssrv',
+      arguments: {},
+      signal,
+    })
+    assert.equal(loaded.isError, false, textOf(loaded))
+    const text = textOf(loaded)
+    assert.match(text, /^ok\n\n### MCP server: instructionssrv\n\n/, 'the instructions must be attributed to their server')
+    assert.match(text, /read before writing/, "the server's own instruction text must reach the model")
+    assert.ok(
+      isolated.tools.schemas().some((entry) => entry.name === 'mcp__instructionssrv__ping'),
+      'the load must still register the tools',
+    )
+  } finally {
+    await isolated.fiber.dispose()
+  }
+})
+
+await check(50, 'instructions over maxInstructionBytes fail the load and name the limit', async () => {
+  const isolated = new Context()
+  isolated.plugin(SystemPrompt)
+  isolated.plugin(ToolRuntime, {})
+  await waitFor(() => isolated.tools !== undefined, 'the isolated tools service')
+  isolated.plugin(plugin, {
+    servers: {
+      longinstr: {
+        description: 'Server whose instructions exceed the cap',
+        mode: 'lazy',
+        command: process.execPath,
+        args: [INSTRUCTIONS],
+        maxInstructionBytes: 16,
+        env: { ECHO_INSTRUCTION: 'x'.repeat(64) },
+      },
+    },
+  })
+  try {
+    await waitFor(
+      () => isolated.tools.schemas().some((entry) => entry.name === 'mcp_longinstr'),
+      'the long-instructions loader',
+    )
+    const loaded = await isolated.tools.execute({
+      callId: 'longinstr-load',
+      name: 'mcp_longinstr',
+      arguments: {},
+      signal,
+    })
+    assert.equal(loaded.isError, true, 'an over-long instruction block must fail the load')
+    assert.match(textOf(loaded), /maxInstructionBytes limit of 16 bytes/, 'the failure must name the configured limit')
+    assert.ok(
+      isolated.tools.schemas().some((entry) => entry.name === 'mcp_longinstr'),
+      'the loader must survive a failed load so the operator can fix the cap',
+    )
+    assert.ok(
+      !isolated.tools.schemas().some((entry) => entry.name.startsWith('mcp__longinstr__')),
+      'a failed load must not register tools',
+    )
   } finally {
     await isolated.fiber.dispose()
   }
