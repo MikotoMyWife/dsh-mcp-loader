@@ -87,6 +87,7 @@ const SINGLE = path.join(here, 'fixtures', 'single-server.mjs')
 const PAGINATED = path.join(here, 'fixtures', 'paginated-server.mjs')
 const ENV_SERVER = path.join(here, 'fixtures', 'env-server.mjs')
 const ODD_RESULT = path.join(here, 'fixtures', 'odd-result-server.mjs')
+const NO_TOOLS = path.join(here, 'fixtures', 'no-tools-server.mjs')
 const FIXTURE_TOOLS = [
   'mcp__fixture__add',
   'mcp__fixture__add_tool',
@@ -1610,6 +1611,49 @@ await check(47, 'a spec-invalid tools/call result still reaches the renderer (ra
     // instead of handing the spec-invalid block to the renderer.
     assert.equal(result.isError, false, `the spec-invalid result must not fail the call: ${textOf(result)}`)
     assert.equal(textOf(result), '{"type":"text"}')
+  } finally {
+    await isolated.fiber.dispose()
+  }
+})
+
+await check(48, 'a server without the tools capability loads empty and is never asked to list', async () => {
+  const isolated = new Context()
+  isolated.plugin(SystemPrompt)
+  isolated.plugin(ToolRuntime, {})
+  await waitFor(() => isolated.tools !== undefined, 'the isolated tools service')
+  const lines = []
+  isolated.logger.exporter({
+    levels: { default: 99 },
+    export(message) {
+      for (const arg of message.args ?? []) {
+        lines.push(arg instanceof Error ? arg.message : String(arg))
+      }
+    },
+  })
+  isolated.plugin(plugin, {
+    servers: {
+      notools: {
+        description: 'Server without a tools capability',
+        mode: 'lazy',
+        command: process.execPath,
+        args: [NO_TOOLS],
+        env: { ECHO_LOG: file('notools.log') },
+      },
+    },
+  })
+  try {
+    await waitFor(() => isolated.tools.schemas().some((entry) => entry.name === 'mcp_notools'), 'the no-tools loader')
+    const loaded = await isolated.tools.execute({ callId: 'notools-load', name: 'mcp_notools', arguments: {}, signal })
+    assert.equal(loaded.isError, false, `a tools-less server must still load: ${textOf(loaded)}`)
+    assert.ok(
+      !isolated.tools.schemas().some((entry) => entry.name.startsWith('mcp__notools__')),
+      'no tool may be registered for a server without the capability',
+    )
+    assert.ok(
+      lines.some((line) => line.includes('declares no tools capability')),
+      'the empty-catalogue disposition must be logged, not silent',
+    )
+    assert.equal(countLines('notools.log', 'list'), 0, 'the plugin must not ask such a server for a tool list')
   } finally {
     await isolated.fiber.dispose()
   }

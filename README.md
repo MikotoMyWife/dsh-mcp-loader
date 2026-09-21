@@ -202,8 +202,11 @@ are deterministic and are never retried.
 - Only one bridge may serve a given server name: each configured name is claimed at mount time, and a second
   instance (another mount of this plugin, or the official `dsh-mcp-client` on the same name) is refused with a
   named error instead of silently failing to register — registration is global, so the public tool names would collide.
-- Images/audio become `[image image/png]` text placeholders; only tools are bridged — MCP resources/prompts/
-  progress and task-typed tools are not supported (consistent with `dsh-mcp-client`).
+- Images/audio become `[image image/png]` text placeholders and only tools are bridged: MCP resources, prompts,
+  progress and task-typed tools are out of scope. This is a deliberate divergence — the official
+  `dsh-mcp-client` 0.1.6 projects images through attachment blocks and bridges resources via `dsh-mcp-resources`.
+- A server that never declares the `tools` capability loads as an empty catalogue (logged once, loader kept) and
+  is never asked for a tool list, so a resources-only server does not fail every load.
 - Reconnection is bounded and lazy: one user-visible operation (a loader load, a tool call, a startup probe) draws
   from a single budget of `reconnectAttempts + 1` connect+discovery tries (`reconnectAttempts`/`reconnectBackoffMs`);
   a failed `tools/call` is surfaced immediately and never replayed. There is no eager background keep-alive/reconnect —

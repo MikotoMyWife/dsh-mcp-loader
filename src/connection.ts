@@ -303,6 +303,8 @@ export class ServerConnection {
    * again instead of overlapping server processes.
    */
   #closureUnconfirmed = false
+  /** Whether the "no tools capability" notice was already logged for this client. */
+  #noToolsCapabilityLogged = false
 
   constructor(name: string, config: ServerConfig, logger: Logger, options: ServerConnectionOptions = {}) {
     this.name = name
@@ -470,6 +472,7 @@ export class ServerConnection {
     this.#client = client
     const rebuilt = this.#dropped || n > 0
     this.#dropped = false
+    this.#noToolsCapabilityLogged = false
     this.#logger.info(
       rebuilt
         ? `[tool-aggregator] MCP server "${this.name}" client rebuilt (attempt ${n + 1})`
@@ -542,6 +545,20 @@ export class ServerConnection {
    * {@link DiscoveryLimitError} naming the server and the reason.
    */
   async #discover(client: Client): Promise<DiscoveredTool[]> {
+    // A server that never declared the tools capability has no tool list to
+    // offer. Treating that as an empty catalogue (instead of failing the load)
+    // keeps resources-only and prompts-only servers from erroring on every
+    // load, and matches the official bridge's disposition. Logged once per
+    // connection so a later re-sync stays quiet.
+    if (client.getServerCapabilities()?.tools === undefined) {
+      if (!this.#noToolsCapabilityLogged) {
+        this.#noToolsCapabilityLogged = true
+        this.#logger.info(
+          `[tool-aggregator] MCP server "${this.name}" declares no tools capability; its tool list is treated as empty`,
+        )
+      }
+      return []
+    }
     const discovered: DiscoveredTool[] = []
     const seen = new Set<string>()
     let cursor: string | undefined
