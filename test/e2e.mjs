@@ -57,6 +57,11 @@
  * | 40| the last holder leaves                                   | the generation is released for everyone                      |
  * | 41| an eager server (no loader)                              | never masked: nothing could reveal it again                  |
  * | 42| re-sync under per-session masks (`sessresync`)            | a newly discovered name is masked for non-holders too        |
+ * | 43| a transport whose close never confirms (`hangclose`)      | teardown is bounded by closeTimeoutMs, logs it, and reuse is refused rather than spawning a second child |
+ * | 44| an invalid closeTimeoutMs                                 | the plugin stays unmounted and names the field               |
+ * | 45| a real stdio child's environment (`envprobe`)             | credentials and DSH_* withheld; proxy variables, NODE_USE_ENV_PROXY, NPM_CONFIG_* and the configured env overlay reach it |
+ * | 46| a second instance claiming one server name                | refused at mount by name; the first instance keeps working    |
+ * | 47| a spec-invalid `tools/call` result (`odd`)                | still reaches the renderer: the result schema stays ours, the client library's spec validator is bypassed |
  */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -81,6 +86,7 @@ const FIXTURE = path.join(here, 'fixtures', 'echo-server.mjs')
 const SINGLE = path.join(here, 'fixtures', 'single-server.mjs')
 const PAGINATED = path.join(here, 'fixtures', 'paginated-server.mjs')
 const ENV_SERVER = path.join(here, 'fixtures', 'env-server.mjs')
+const ODD_RESULT = path.join(here, 'fixtures', 'odd-result-server.mjs')
 const FIXTURE_TOOLS = [
   'mcp__fixture__add',
   'mcp__fixture__add_tool',
@@ -1572,6 +1578,41 @@ await check(46, 'a second instance claiming the same server name fails at mount 
     'the first instance must keep its loader',
   )
   await isolated.fiber.dispose()
+})
+
+await check(47, 'a spec-invalid tools/call result still reaches the renderer (raw request path is locked)', async () => {
+  const isolated = new Context()
+  isolated.plugin(SystemPrompt)
+  isolated.plugin(ToolRuntime, {})
+  await waitFor(() => isolated.tools !== undefined, 'the isolated tools service')
+  isolated.plugin(plugin, {
+    servers: {
+      odd: {
+        description: 'Off-spec result server',
+        mode: 'lazy',
+        command: process.execPath,
+        args: [ODD_RESULT],
+      },
+    },
+  })
+  try {
+    await waitFor(() => isolated.tools.schemas().some((entry) => entry.name === 'mcp_odd'), 'the odd-result loader')
+    const loaded = await isolated.tools.execute({ callId: 'odd-load', name: 'mcp_odd', arguments: {}, signal })
+    assert.equal(loaded.isError, false, 'the off-spec server must load')
+    const result = await isolated.tools.execute({
+      callId: 'odd-call',
+      name: 'mcp__odd__odd',
+      arguments: {},
+      signal,
+    })
+    // The result schema must stay ours: had the request fallen back to the
+    // client library's spec validator, this call would fail with InvalidResult
+    // instead of handing the spec-invalid block to the renderer.
+    assert.equal(result.isError, false, `the spec-invalid result must not fail the call: ${textOf(result)}`)
+    assert.equal(textOf(result), '{"type":"text"}')
+  } finally {
+    await isolated.fiber.dispose()
+  }
 })
 
 const failures = results.filter((entry) => entry.status === 'FAIL')

@@ -89,6 +89,10 @@ npm run build          # tsc → lib/
 npm test               # real-link e2e: real cordis ctx + dsh-tools ToolRuntime + real MCP stdio subprocesses
 ```
 
+The MCP client layer is `@modelcontextprotocol/client` 2.0.0 — the same line the harness itself ships — and it is
+the only runtime dependency besides Node builtins. The v1 `@modelcontextprotocol/sdk` stays a devDependency for the
+test fixtures, which are v1 *servers*.
+
 Then register the plugin in your profile (id `mcp-loader`, package `dsh-mcp-loader`) and add your servers:
 
 ```yaml

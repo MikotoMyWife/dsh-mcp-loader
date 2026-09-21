@@ -1,4 +1,4 @@
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { Client } from '@modelcontextprotocol/client';
 import type { DiscoveredTool, ServerConfig } from './types.js';
 /** Default per-`tools/call` deadline. */
 export declare const DEFAULT_TOOL_CALL_TIMEOUT_MS = 60000;
@@ -44,16 +44,19 @@ export declare class UnconfirmedCloseError extends Error {
 /**
  * Whether a failed connect or discovery is worth retrying.
  *
- * Only transient establish/transport/timeout failures qualify: the MCP SDK
- * maps a dead transport and an in-flight request timeout to
- * `McpError(ConnectionClosed / RequestTimeout)`, while any other `McpError` is
- * an answered protocol error a retry will not fix. Plain errors (spawn
- * failures, our connect wrapper, handshake timeouts) are establish failures by
- * nature and are retried. Deterministic failures are never retried: discovery
- * caps (`DiscoveryLimitError`) cannot shrink a server's catalogue on a second
- * try, and an unconfirmed close ({@link UnconfirmedCloseError}) must not spawn
- * an overlapping child. A failed `tools/call` never reaches this predicate —
- * {@link ServerConnection.callTool} invalidates and rethrows without replaying.
+ * Only transient establish/transport/timeout failures qualify. The v2 client
+ * splits what v1 packed into `McpError`: a local failure is an `SdkError` with a
+ * string code (`ConnectionClosed` / `RequestTimeout` are the transient ones, and
+ * a dead transport or an in-flight timeout maps to them), while a JSON-RPC error
+ * the server actually answered is a `ProtocolError` — retrying an answered
+ * error cannot help, so every `ProtocolError` is final. Plain errors (spawn
+ * failures, our connect wrapper, handshake timeouts, "Not connected") are
+ * establish failures by nature and are retried. Deterministic failures are never
+ * retried: discovery caps (`DiscoveryLimitError`) cannot shrink a server's
+ * catalogue on a second try, and an unconfirmed close
+ * ({@link UnconfirmedCloseError}) must not spawn an overlapping child. A failed
+ * `tools/call` never reaches this predicate — {@link ServerConnection.callTool}
+ * invalidates and rethrows without replaying.
  */
 export declare function isRetryable(error: unknown): boolean;
 /** The logging surface the plugin needs; Cordis supplies it, tests may not. */
