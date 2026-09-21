@@ -1,9 +1,25 @@
-# Source-only repository: track code and the files required to build/install it.
-# Local docs (future documentation site), agent scaffolding and project
-# progress stay untracked here.
-node_modules/
-docs/
-.agents/
-.agents.md
-skills/
-*.tgz
+# Allowlist mode: nothing is tracked unless it is listed below.
+# Local docs (the future documentation site), agent scaffolding, progress notes,
+# downloads and ad-hoc probes stay untracked even when they exist on disk.
+*
+# Directories this repository owns; everything else is never descended into.
+!/src/
+!/lib/
+!/test/
+# Files required to build, install, publish or work in this repository.
+!/.gitignore
+!/LICENSE
+!/README.md
+!/cordis.patch.yml
+!/package.json
+!/package-lock.json
+!/tsconfig.json
+# Contents of the owned directories.
+!/src/**
+!/lib/**
+!/test/**
+# Root-level local-only files that must never enter the repository.
+/src/x.ts
+/lib/x.*
+/out.md
+/agents.md
