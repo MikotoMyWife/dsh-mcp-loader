@@ -66,13 +66,17 @@ loader, so every server is per-session).
 - **Bounded disposal** — every dropped generation is closed under a `closeTimeoutMs` deadline. A transport that
   cannot confirm its closure is logged and poisons that connection: it refuses to reconnect, because the child
   may still be running and a fresh connect would start a second one for the same server.
+- **Child environment** — a stdio server is spawned with the parent environment minus every credential-shaped key
+  (`/KEY|PASSWORD|SECRET|TOKEN/i`) and every `DSH_*` fact, so an `npx`/`mcp-remote` server keeps `PATH`,
+  `NPM_CONFIG_*` and the proxy variables (with `NODE_USE_ENV_PROXY` set when they are `http(s)` URLs) that the
+  SDK's minimal default environment would have dropped. A configured `env` entry merges last and always wins.
 - **Discovery hard caps** — per server, a real discovery is bounded by `maxToolListPages` pages, `maxToolsPerServer`
   raw tools and a `discoveryTimeoutMs` deadline; exceeding any of them fails the load/re-sync with an error naming
   the server and the reason, keeps the loader tool, and is never retried.
 - **Ordered re-syncs** — a per-server monotonic discovery generation makes sure two concurrent `list_changed`
   re-syncs (or a re-sync racing a load) can never have an older snapshot land after — and overwrite — a newer one:
   a stale discovery result is discarded instead of being applied.
-- **Transports** — `stdio` (spawn `command`/`args`, `env` merged into the SDK default environment) and
+- **Transports** — `stdio` (spawn `command`/`args` with a scrubbed child environment) and
   `streamable-http` (`url`/`headers`).
 - **Config fail-fast** — unknown preset or invalid server name (`[A-Za-z0-9_-]{1,32}`) fails plugin mount with a
   named field.
@@ -117,7 +121,7 @@ Then register the plugin in your profile (id `mcp-loader`, package `dsh-mcp-load
 | `servers.<n>.descriptionPreset` | — | Built-in description tables (`desktop-touch`) |
 | `servers.<n>.maxParameterDescriptionChars` | `0` | Truncate parameter descriptions (preset may imply one) |
 | `servers.<n>.transport` | `stdio` | `stdio` or `streamable-http` |
-| `servers.<n>.command`/`args`/`env`/`cwd` | — | stdio process to spawn |
+| `servers.<n>.command`/`args`/`env`/`cwd` | — | stdio process to spawn; `env` merges over the scrubbed parent environment (credential-shaped keys and `DSH_*` are withheld, proxies and `NPM_CONFIG_*` are kept) |
 | `servers.<n>.url`/`headers` | — | streamable-http endpoint and extra headers |
 | `servers.<n>.toolCallTimeoutMs` | `60000` | Per `tools/call` timeout |
 | `servers.<n>.reconnectAttempts` | `1` | Per user-visible operation (a loader load, a tool call, a startup probe): retries after a failed connect/discovery — connect and discovery share one budget of `reconnectAttempts + 1` tries (`0` = exactly one attempt, v0.5.0 behavior) |
@@ -191,6 +195,9 @@ are deterministic and are never retried.
   so a tool that first appears in a later re-sync is masked for agents created after that re-sync, not for agents
   that were already masked under the earlier expansion.
 - Startup probing is a snapshot: a server that later grows past the threshold stays revealed until restart (pin it with `mode: lazy`).
+- Only one bridge may serve a given server name: each configured name is claimed at mount time, and a second
+  instance (another mount of this plugin, or the official `dsh-mcp-client` on the same name) is refused with a
+  named error instead of silently failing to register — registration is global, so the public tool names would collide.
 - Images/audio become `[image image/png]` text placeholders; only tools are bridged — MCP resources/prompts/
   progress and task-typed tools are not supported (consistent with `dsh-mcp-client`).
 - Reconnection is bounded and lazy: one user-visible operation (a loader load, a tool call, a startup probe) draws

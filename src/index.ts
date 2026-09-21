@@ -41,6 +41,18 @@ export const name = 'tool-aggregator'
 /** Cordis dependency: the tool registry must exist before this plugin applies. */
 export const inject = ['tools']
 
+/**
+ * Server names already claimed per composition root.
+ *
+ * Registration is deployment-wide (global), so two instances of this plugin —
+ * or this plugin next to the official `dsh-mcp-client` — cannot both own the
+ * same server name: the public tool names would collide. Claiming the names at
+ * mount time turns that into a named error instead of a silent registration
+ * rollback later. Keyed by `ctx.root` rather than by scope, because the
+ * collision is global by construction.
+ */
+const claimedServerNames = new WeakMap<object, Set<string>>()
+
 /** Whether a rule string contains glob metacharacters. */
 function isGlobRule(rule: string): boolean {
   return rule.includes('*') || rule.includes('?')
@@ -153,6 +165,23 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     // Fail fast on an unknown description preset instead of at first load.
     descriptionOverridesFor(serverConfig)
   }
+
+  // Claim every server name in this composition root: a second instance with
+  // the same name would register the same public tool names globally.
+  const root = ctx.root as object
+  let claimed = claimedServerNames.get(root)
+  if (claimed === undefined) {
+    claimed = new Set<string>()
+    claimedServerNames.set(root, claimed)
+  }
+  const owner = Object.keys(serverConfigs).find((serverName) => claimed.has(serverName))
+  if (owner !== undefined) {
+    throw new Error(
+      `tool-aggregator: server name "${owner}" is already in use by another tool-aggregator instance in this composition; `
+      + 'pick a unique server name (the official dsh-mcp-client must not serve the same name either — the public tool names would collide)',
+    )
+  }
+  for (const serverName of Object.keys(serverConfigs)) claimed.add(serverName)
 
   const found = ctx.get('tools') as ToolRegistrar | undefined
   if (found === undefined) {
@@ -970,6 +999,8 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     idleDisconnectCount.clear()
     for (const connection of connections.values()) void connection.close()
     connections.clear()
+    // Release this instance's claims so a remount of the same composition works.
+    for (const serverName of Object.keys(serverConfigs)) claimed.delete(serverName)
   }, 'tool-aggregator cleanup')
 
   if (probeAtStartup && connections.size > 0) {

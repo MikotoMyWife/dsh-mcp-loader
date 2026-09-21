@@ -15,9 +15,10 @@
  */
 import { createHash } from 'node:crypto'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js'
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { ErrorCode, McpError, ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js'
+import { childEnv } from './env.js'
 import type { DiscoveredTool, ServerConfig } from './types.js'
 
 /** DeepSeek function-name contract: at most 64 characters. */
@@ -446,8 +447,10 @@ export class ServerConnection {
     return new StdioClientTransport({
       command: this.#config.command as string,
       args: this.#config.args ?? [],
-      // Merge over the SDK default so a partial env map never drops PATH.
-      env: { ...getDefaultEnvironment(), ...this.#config.env },
+      // The scrubbed parent environment (never the SDK's minimal default): a
+      // server started through npx needs PATH, NPM_CONFIG_* and the proxy
+      // variables, while credentials and DSH_* facts are withheld.
+      env: childEnv(this.#config.env),
       cwd: this.#config.cwd,
     })
   }

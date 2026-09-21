@@ -80,6 +80,7 @@ const plugin = pluginModule.default ?? pluginModule
 const FIXTURE = path.join(here, 'fixtures', 'echo-server.mjs')
 const SINGLE = path.join(here, 'fixtures', 'single-server.mjs')
 const PAGINATED = path.join(here, 'fixtures', 'paginated-server.mjs')
+const ENV_SERVER = path.join(here, 'fixtures', 'env-server.mjs')
 const FIXTURE_TOOLS = [
   'mcp__fixture__add',
   'mcp__fixture__add_tool',
@@ -1475,6 +1476,102 @@ await check(44, 'an invalid closeTimeoutMs keeps the plugin unmounted and names 
     { closeTimeoutMs: 1.5, command: process.execPath, args: [FIXTURE] },
     '"closeTimeoutMs" must be a positive integer',
   )
+})
+
+await check(45, 'the stdio child gets a scrubbed but complete environment', async () => {
+  const secrets = {
+    MCP_FAKE_TOKEN: 'token-should-never-leak',
+    MCP_FAKE_PASSWORD: 'password-should-never-leak',
+    MCP_FAKE_KEY: 'key-should-never-leak',
+    DSH_FAKE_FACT: 'dsh-fact-should-never-leak',
+  }
+  const passthrough = {
+    HTTPS_PROXY: 'http://proxy.example:8080',
+    NPM_CONFIG_REGISTRY: 'https://registry.example/',
+  }
+  Object.assign(process.env, secrets, passthrough)
+  const isolated = new Context()
+  isolated.plugin(SystemPrompt)
+  isolated.plugin(ToolRuntime, {})
+  await waitFor(() => isolated.tools !== undefined, 'the isolated tools service')
+  isolated.plugin(plugin, {
+    servers: {
+      envprobe: {
+        description: 'Environment probe',
+        mode: 'lazy',
+        command: process.execPath,
+        args: [ENV_SERVER],
+        env: { MCP_EXTRA: 'from-config' },
+      },
+    },
+  })
+  try {
+    await waitFor(() => isolated.tools.schemas().some((entry) => entry.name === 'mcp_envprobe'), 'the env loader')
+    const loaded = await isolated.tools.execute({ callId: 'env-load', name: 'mcp_envprobe', arguments: {}, signal })
+    assert.equal(loaded.isError, false, 'the env server must load')
+    const result = await isolated.tools.execute({
+      callId: 'env-report',
+      name: 'mcp__envprobe__env_report',
+      arguments: {},
+      signal,
+    })
+    const report = Object.fromEntries(
+      (result.content ?? [])
+        .map((block) => (typeof block?.text === 'string' ? block.text : ''))
+        .join('\n')
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => {
+          const at = line.indexOf('=')
+          return [line.slice(0, at), line.slice(at + 1)]
+        }),
+    )
+    for (const [key, value] of Object.entries(secrets)) {
+      assert.equal(report[key], '(absent)', `${key} leaked into the MCP child (${value})`)
+    }
+    for (const [key, value] of Object.entries(passthrough)) {
+      assert.equal(report[key], value, `${key} must reach the child, which npx-based servers route through`)
+    }
+    assert.equal(report.NODE_USE_ENV_PROXY, '1', 'a child Node needs the flag to honor the inherited proxy')
+    assert.equal(report.MCP_EXTRA, 'from-config', 'the configured env overlay must win')
+    assert.notEqual(report.PATH, '(absent)', 'PATH must survive the scrub or npx cannot resolve')
+  } finally {
+    for (const key of [...Object.keys(secrets), ...Object.keys(passthrough)]) delete process.env[key]
+    await isolated.fiber.dispose()
+  }
+})
+
+await check(46, 'a second instance claiming the same server name fails at mount and names it', async () => {
+  const isolated = new Context()
+  isolated.plugin(SystemPrompt)
+  isolated.plugin(ToolRuntime, {})
+  await waitFor(() => isolated.tools !== undefined, 'the isolated tools service')
+  const lines = []
+  isolated.logger.exporter({
+    levels: { default: 99 },
+    export(message) {
+      for (const arg of message.args ?? []) {
+        lines.push(arg instanceof Error ? arg.message : String(arg))
+      }
+    },
+  })
+  const config = { servers: { duplicate: { mode: 'lazy', command: process.execPath, args: [SINGLE] } } }
+  isolated.plugin(plugin, config)
+  await waitFor(
+    () => isolated.tools.schemas().some((entry) => entry.name === 'mcp_duplicate'),
+    'the first instance loader',
+  )
+  isolated.plugin(plugin, config)
+  await waitFor(
+    () => lines.some((line) => line.includes('already in use by another tool-aggregator instance') && line.includes('"duplicate"')),
+    'the duplicate server-name mount error',
+  )
+  // The first instance keeps working: the claim only rejects the newcomer.
+  assert.ok(
+    isolated.tools.schemas().some((entry) => entry.name === 'mcp_duplicate'),
+    'the first instance must keep its loader',
+  )
+  await isolated.fiber.dispose()
 })
 
 const failures = results.filter((entry) => entry.status === 'FAIL')
