@@ -16,6 +16,8 @@ export declare const DEFAULT_MAX_TOOL_LIST_PAGES = 100;
 export declare const DEFAULT_MAX_TOOLS_PER_SERVER = 500;
 /** Default discovery deadline for one real pagination, in milliseconds. */
 export declare const DEFAULT_DISCOVERY_TIMEOUT_MS = 60000;
+/** Default deadline for confirming that a transport really closed. */
+export declare const DEFAULT_CLOSE_TIMEOUT_MS = 5000;
 /** Which discovery hard cap was hit. */
 export type DiscoveryLimitReason = 'pages' | 'tools' | 'timeout';
 /**
@@ -30,6 +32,16 @@ export declare class DiscoveryLimitError extends Error {
     constructor(serverName: string, reason: DiscoveryLimitReason, limit: number);
 }
 /**
+ * A teardown could not confirm that the server's transport closed, so this
+ * connection refuses to reconnect: the child process may still be alive and a
+ * fresh connect would start a second one for the same server. Only a plugin (or
+ * session) restart clears this — deliberately not retryable, because retrying is
+ * exactly what would create the overlapping process.
+ */
+export declare class UnconfirmedCloseError extends Error {
+    constructor(serverName: string);
+}
+/**
  * Whether a failed connect or discovery is worth retrying.
  *
  * Only transient establish/transport/timeout failures qualify: the MCP SDK
@@ -37,10 +49,11 @@ export declare class DiscoveryLimitError extends Error {
  * `McpError(ConnectionClosed / RequestTimeout)`, while any other `McpError` is
  * an answered protocol error a retry will not fix. Plain errors (spawn
  * failures, our connect wrapper, handshake timeouts) are establish failures by
- * nature and are retried. Deterministic discovery caps (`DiscoveryLimitError`)
- * are never retried — a retry cannot change how many tools a server exposes.
- * A failed `tools/call` never reaches this predicate — {@link
- * ServerConnection.callTool} invalidates and rethrows without replaying.
+ * nature and are retried. Deterministic failures are never retried: discovery
+ * caps (`DiscoveryLimitError`) cannot shrink a server's catalogue on a second
+ * try, and an unconfirmed close ({@link UnconfirmedCloseError}) must not spawn
+ * an overlapping child. A failed `tools/call` never reaches this predicate —
+ * {@link ServerConnection.callTool} invalidates and rethrows without replaying.
  */
 export declare function isRetryable(error: unknown): boolean;
 /** The logging surface the plugin needs; Cordis supplies it, tests may not. */
@@ -72,10 +85,24 @@ export interface ConnectionStatus {
 export declare function publicToolName(serverName: string, rawName: string): string;
 /** Collect every configuration problem for one server entry, in report order. */
 export declare function validateServerConfig(name: string, config: ServerConfig): string[];
+/** The transport type `Client.connect` accepts. */
+type TransportLike = Parameters<Client['connect']>[0];
+/** Construction options for one {@link ServerConnection}. */
+export interface ServerConnectionOptions {
+    /** Connection handshake deadline in milliseconds. */
+    connectTimeoutMs?: number;
+    /**
+     * Test seam: build the transport for this connection. Defaults to stdio or
+     * streamable-http per config. A transport whose `close()` never settles cannot
+     * be produced with a real stdio child on Windows (Node terminates the process
+     * outright), so the close barrier is verified through this seam.
+     */
+    transportFactory?: (name: string, config: ServerConfig) => TransportLike;
+}
 export declare class ServerConnection {
     #private;
     readonly name: string;
-    constructor(name: string, config: ServerConfig, logger: Logger, connectTimeoutMs?: number);
+    constructor(name: string, config: ServerConfig, logger: Logger, options?: ServerConnectionOptions);
     /**
      * Connect on first use with the connection's retry budget; concurrent
      * callers share the one in-flight attempt. Only the *establish* is retried —
@@ -109,8 +136,16 @@ export declare class ServerConnection {
      * able to rebuild the connection on the next load.
      */
     disconnect(): Promise<void>;
+    /**
+     * Permanent teardown: close the current client and refuse further use.
+     *
+     * Bounded by `closeTimeoutMs` — if the transport will not confirm closure the
+     * connection logs it and is poisoned, so teardown can never hang forever on a
+     * server that ignores shutdown.
+     */
     close(): Promise<void>;
 }
 /** One-line error text for logs and model-facing messages. */
 export declare function messageOf(error: unknown): string;
+export {};
 //# sourceMappingURL=connection.d.ts.map

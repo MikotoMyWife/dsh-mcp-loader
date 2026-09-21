@@ -135,6 +135,15 @@ export interface ServerConfig {
    * Defaults to 60_000.
    */
   discoveryTimeoutMs?: number
+  /**
+   * Deadline in milliseconds for confirming that a transport actually closed.
+   * When a client is dropped (teardown, idle disconnect, failed connect/call)
+   * and its closure is not confirmed within this deadline, the connection is
+   * poisoned: it logs the condition and refuses to reconnect, because the
+   * server's child process may still be running and a new connect would start
+   * an overlapping one. Defaults to 5_000.
+   */
+  closeTimeoutMs?: number
 }
 
 /** Plugin config. */

@@ -42,6 +42,8 @@ export const DEFAULT_MAX_TOOL_LIST_PAGES = 100
 export const DEFAULT_MAX_TOOLS_PER_SERVER = 500
 /** Default discovery deadline for one real pagination, in milliseconds. */
 export const DEFAULT_DISCOVERY_TIMEOUT_MS = 60_000
+/** Default deadline for confirming that a transport really closed. */
+export const DEFAULT_CLOSE_TIMEOUT_MS = 5_000
 
 /** Which discovery hard cap was hit. */
 export type DiscoveryLimitReason = 'pages' | 'tools' | 'timeout'
@@ -69,6 +71,23 @@ export class DiscoveryLimitError extends Error {
 }
 
 /**
+ * A teardown could not confirm that the server's transport closed, so this
+ * connection refuses to reconnect: the child process may still be alive and a
+ * fresh connect would start a second one for the same server. Only a plugin (or
+ * session) restart clears this — deliberately not retryable, because retrying is
+ * exactly what would create the overlapping process.
+ */
+export class UnconfirmedCloseError extends Error {
+  constructor(serverName: string) {
+    super(
+      `MCP server "${serverName}" was closed but its transport closure could not be confirmed; `
+      + 'refusing to reconnect to avoid overlapping server processes (restart the plugin or session to retry)',
+    )
+    this.name = 'UnconfirmedCloseError'
+  }
+}
+
+/**
  * Whether a failed connect or discovery is worth retrying.
  *
  * Only transient establish/transport/timeout failures qualify: the MCP SDK
@@ -76,13 +95,15 @@ export class DiscoveryLimitError extends Error {
  * `McpError(ConnectionClosed / RequestTimeout)`, while any other `McpError` is
  * an answered protocol error a retry will not fix. Plain errors (spawn
  * failures, our connect wrapper, handshake timeouts) are establish failures by
- * nature and are retried. Deterministic discovery caps (`DiscoveryLimitError`)
- * are never retried — a retry cannot change how many tools a server exposes.
- * A failed `tools/call` never reaches this predicate — {@link
- * ServerConnection.callTool} invalidates and rethrows without replaying.
+ * nature and are retried. Deterministic failures are never retried: discovery
+ * caps (`DiscoveryLimitError`) cannot shrink a server's catalogue on a second
+ * try, and an unconfirmed close ({@link UnconfirmedCloseError}) must not spawn
+ * an overlapping child. A failed `tools/call` never reaches this predicate —
+ * {@link ServerConnection.callTool} invalidates and rethrows without replaying.
  */
 export function isRetryable(error: unknown): boolean {
   if (error instanceof DiscoveryLimitError) return false
+  if (error instanceof UnconfirmedCloseError) return false
   if (error instanceof McpError) {
     return error.code === ErrorCode.ConnectionClosed || error.code === ErrorCode.RequestTimeout
   }
@@ -168,7 +189,7 @@ export function validateServerConfig(name: string, config: ServerConfig): string
       problems.push(`"${field}" must be a non-negative integer`)
     }
   }
-  for (const field of ['maxToolListPages', 'maxToolsPerServer', 'discoveryTimeoutMs'] as const) {
+  for (const field of ['maxToolListPages', 'maxToolsPerServer', 'discoveryTimeoutMs', 'closeTimeoutMs'] as const) {
     const value = config[field]
     if (value !== undefined && (!Number.isInteger(value) || value <= 0)) {
       problems.push(`"${field}" must be a positive integer`)
@@ -194,6 +215,22 @@ function withTimeout<T>(promise: Promise<T>, ms: number, what: string, onTimeout
   })
 }
 
+/** The transport type `Client.connect` accepts. */
+type TransportLike = Parameters<Client['connect']>[0]
+
+/** Construction options for one {@link ServerConnection}. */
+export interface ServerConnectionOptions {
+  /** Connection handshake deadline in milliseconds. */
+  connectTimeoutMs?: number
+  /**
+   * Test seam: build the transport for this connection. Defaults to stdio or
+   * streamable-http per config. A transport whose `close()` never settles cannot
+   * be produced with a real stdio child on Windows (Node terminates the process
+   * outright), so the close barrier is verified through this seam.
+   */
+  transportFactory?: (name: string, config: ServerConfig) => TransportLike
+}
+
 export class ServerConnection {
   readonly name: string
   #config: ServerConfig
@@ -205,6 +242,8 @@ export class ServerConnection {
   #maxToolListPages: number
   #maxToolsPerServer: number
   #discoveryTimeoutMs: number
+  #closeTimeoutMs: number
+  #transportFactory: ServerConnectionOptions['transportFactory']
   #client: Client | undefined
   #connecting: Promise<Client> | undefined
   #tools: DiscoveredTool[] | undefined
@@ -216,18 +255,26 @@ export class ServerConnection {
   /** The current retry backoff sleep, woken early by `#interruptRetry()`. */
   #retrySleep: { timer: NodeJS.Timeout; wake: () => void } | undefined
   #closed = false
+  /**
+   * A close was not confirmed in time, so the child may still be alive. Set by
+   * {@link #closeGeneration}; from then on this connection refuses to connect
+   * again instead of overlapping server processes.
+   */
+  #closureUnconfirmed = false
 
-  constructor(name: string, config: ServerConfig, logger: Logger, connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS) {
+  constructor(name: string, config: ServerConfig, logger: Logger, options: ServerConnectionOptions = {}) {
     this.name = name
     this.#config = config
     this.#logger = logger
-    this.#connectTimeoutMs = connectTimeoutMs
+    this.#connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
+    this.#transportFactory = options.transportFactory
     this.#toolCallTimeoutMs = config.toolCallTimeoutMs ?? DEFAULT_TOOL_CALL_TIMEOUT_MS
     this.#reconnectAttempts = config.reconnectAttempts ?? DEFAULT_RECONNECT_ATTEMPTS
     this.#reconnectBackoffMs = config.reconnectBackoffMs ?? DEFAULT_RECONNECT_BACKOFF_MS
     this.#maxToolListPages = config.maxToolListPages ?? DEFAULT_MAX_TOOL_LIST_PAGES
     this.#maxToolsPerServer = config.maxToolsPerServer ?? DEFAULT_MAX_TOOLS_PER_SERVER
     this.#discoveryTimeoutMs = config.discoveryTimeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS
+    this.#closeTimeoutMs = config.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS
   }
 
   /**
@@ -246,6 +293,7 @@ export class ServerConnection {
    */
   async #acquire(n: number): Promise<Client> {
     if (this.#closed) throw new Error(`MCP server "${this.name}" is closed`)
+    if (this.#closureUnconfirmed) throw new UnconfirmedCloseError(this.name)
     if (this.#client !== undefined) return this.#client
     if (this.#connecting === undefined) {
       this.#connecting = this.#connectOnce(n).finally(() => {
@@ -316,6 +364,49 @@ export class ServerConnection {
   }
 
   /**
+   * Close one client generation and confirm that the transport really closed,
+   * bounded by `closeTimeoutMs`.
+   *
+   * A closing transport that does not settle in time (a child that ignores
+   * shutdown, a half-open HTTP stream) leaves the server possibly alive, so the
+   * connection is poisoned and refuses to reconnect — mirroring the disposal
+   * barrier `@deepseek-ai/dsh-mcp-client` added in 0.1.6, whose stated risk is
+   * exactly an overlapping server process. A rejected `close()` is treated as
+   * unconfirmed for the same reason: nothing proved the child is gone.
+   *
+   * @returns whether closure was confirmed.
+   */
+  async #closeGeneration(client: Client, context: string): Promise<boolean> {
+    let failure: unknown
+    let timer: NodeJS.Timeout | undefined
+    const closed = client.close().then(
+      () => true,
+      (error: unknown) => {
+        failure = error
+        return false
+      },
+    )
+    const confirmed = await Promise.race([
+      closed,
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), this.#closeTimeoutMs)
+      }),
+    ])
+    if (timer !== undefined) clearTimeout(timer)
+    if (!confirmed) {
+      this.#closureUnconfirmed = true
+      const detail = failure === undefined
+        ? `no confirmation within ${this.#closeTimeoutMs}ms`
+        : `close failed: ${messageOf(failure)}`
+      this.#logger.warn(
+        `[tool-aggregator] MCP server "${this.name}" (${context}): transport closure could not be confirmed (${detail}) `
+        + '— server shutdown may be incomplete; refusing to reconnect to avoid overlapping server processes',
+      )
+    }
+    return confirmed
+  }
+
+  /**
    * Establish one connection. A failed attempt closes its own transport, so it
    * is never reusable; retrying here is safe because no request has been sent
    * yet — tools/call is never replayed anywhere. `n` is the attempt ordinal of
@@ -331,7 +422,7 @@ export class ServerConnection {
     try {
       await withTimeout(client.connect(this.#transport()), this.#connectTimeoutMs, `connect to MCP server "${this.name}"`)
     } catch (error) {
-      await client.close().catch(() => {})
+      await this.#closeGeneration(client, 'failed connect')
       throw new Error(`could not connect to MCP server "${this.name}": ${messageOf(error)}`)
     }
     this.#client = client
@@ -345,7 +436,8 @@ export class ServerConnection {
     return client
   }
 
-  #transport() {
+  #transport(): TransportLike {
+    if (this.#transportFactory !== undefined) return this.#transportFactory(this.name, this.#config)
     if ((this.#config.transport ?? 'stdio') === 'streamable-http') {
       return new StreamableHTTPClientTransport(new URL(this.#config.url as string), {
         requestInit: { headers: this.#config.headers },
@@ -391,7 +483,7 @@ export class ServerConnection {
         if (isRetryable(error) || (error instanceof DiscoveryLimitError && error.reason === 'timeout')) {
           this.#client = undefined
           this.#dropped = true
-          await client.close().catch(() => {})
+          await this.#closeGeneration(client, 'failed discovery')
         }
         throw error
       }
@@ -468,7 +560,7 @@ export class ServerConnection {
         this.#client = undefined
         this.#tools = undefined
         this.#dropped = true
-        await client.close().catch(() => {})
+        await this.#closeGeneration(client, 'failed call')
         this.#logger.warn(`[tool-aggregator] MCP server "${this.name}" dropped after a failed call: ${messageOf(error)}`)
       }
       throw error
@@ -513,9 +605,16 @@ export class ServerConnection {
     const client = this.#client
     this.#client = undefined
     this.#tools = undefined
-    if (client !== undefined) await client.close().catch(() => {})
+    if (client !== undefined) await this.#closeGeneration(client, 'idle disconnect')
   }
 
+  /**
+   * Permanent teardown: close the current client and refuse further use.
+   *
+   * Bounded by `closeTimeoutMs` — if the transport will not confirm closure the
+   * connection logs it and is poisoned, so teardown can never hang forever on a
+   * server that ignores shutdown.
+   */
   async close(): Promise<void> {
     this.#closed = true
     this.#onListChanged = undefined
@@ -525,7 +624,7 @@ export class ServerConnection {
     const client = this.#client
     this.#client = undefined
     this.#tools = undefined
-    if (client !== undefined) await client.close().catch(() => {})
+    if (client !== undefined) await this.#closeGeneration(client, 'plugin teardown')
   }
 }
 

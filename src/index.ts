@@ -163,7 +163,7 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
 
   const connections = new Map<string, ServerConnection>()
   for (const [serverName, serverConfig] of Object.entries(serverConfigs)) {
-    connections.set(serverName, new ServerConnection(serverName, serverConfig, logger, config.connectTimeoutMs))
+    connections.set(serverName, new ServerConnection(serverName, serverConfig, logger, { connectTimeoutMs: config.connectTimeoutMs }))
   }
 
   /** server name -> loader tool registration disposer */

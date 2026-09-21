@@ -63,6 +63,9 @@ loader, so every server is per-session).
 - **Resilience** — atomic registration (any failure rolls the server back to zero tools), shared concurrent
   attempts, `list_changed` resync (full-generation replace), raw `tools/call` (skips outputSchema validation of
   `structuredContent`, same as the official client), transport-failure discard-and-reconnect on next call.
+- **Bounded disposal** — every dropped generation is closed under a `closeTimeoutMs` deadline. A transport that
+  cannot confirm its closure is logged and poisons that connection: it refuses to reconnect, because the child
+  may still be running and a fresh connect would start a second one for the same server.
 - **Discovery hard caps** — per server, a real discovery is bounded by `maxToolListPages` pages, `maxToolsPerServer`
   raw tools and a `discoveryTimeoutMs` deadline; exceeding any of them fails the load/re-sync with an error naming
   the server and the reason, keeps the loader tool, and is never retried.
@@ -123,6 +126,7 @@ Then register the plugin in your profile (id `mcp-loader`, package `dsh-mcp-load
 | `servers.<n>.maxToolListPages` | `100` | Discovery hard cap: max `tools/list` pages per real discovery; exceeding it fails the load/re-sync naming `pages` (never retried, never truncated) |
 | `servers.<n>.maxToolsPerServer` | `500` | Discovery hard cap: max raw tools one server may expose; exceeding it fails naming `tools` (counted before `disabledTools`) |
 | `servers.<n>.discoveryTimeoutMs` | `60000` | Discovery deadline for one real pagination; a timeout fails naming `timeout` and drops the connection so a hung server never blocks later calls |
+| `servers.<n>.closeTimeoutMs` | `5000` | Deadline for confirming that a dropped server's transport really closed; an unconfirmed closure is logged and the connection refuses to reconnect (the child may still be running, so a new connect would overlap it) |
 | `connectTimeoutMs` | `30000` | Connection handshake timeout |
 | `singleToolThreshold` | `1` | `auto` mode: servers with ≤ this many tools stay resident |
 | `loaderHint` | `Call to load this MCP server's tools into this session; call again to hide them.` | Appended to every loader description |

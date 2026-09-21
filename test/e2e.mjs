@@ -1385,6 +1385,98 @@ await check(42, 'a re-sync extends the per-session mask to newly discovered name
   }
 })
 
+await check(43, 'a close that cannot be confirmed poisons the connection instead of hanging teardown', async () => {
+  const { ServerConnection } = await import(pathToFileURL(path.join(here, '..', 'lib', 'connection.js')).href)
+  const lines = []
+  const logger = {
+    info: (message) => lines.push(message),
+    warn: (message) => lines.push(message),
+    error: (message) => lines.push(message),
+  }
+  // A transport whose close() never settles cannot be built from a real stdio
+  // child on Windows (Node terminates it outright), so the barrier is exercised
+  // through the documented transport seam with a synthetic one.
+  const hangingTransport = {
+    async start() {
+      throw new Error('synthetic start failure')
+    },
+    async send() {
+      throw new Error('unused')
+    },
+    async close() {
+      return new Promise(() => {})
+    },
+  }
+  const withDeadline = (promise, ms, label) =>
+    Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} did not settle within ${ms}ms`)), ms)),
+    ])
+  const connection = new ServerConnection(
+    'hangclose',
+    { command: process.execPath, closeTimeoutMs: 120, reconnectAttempts: 0 },
+    logger,
+    { connectTimeoutMs: 200, transportFactory: () => hangingTransport },
+  )
+  const started = Date.now()
+  await assert.rejects(
+    () => withDeadline(connection.listTools(), 2_000, 'the failed connect'),
+    /could not connect to MCP server "hangclose"/,
+  )
+  const elapsed = Date.now() - started
+  assert.ok(elapsed < 3_000, `teardown must be bounded by closeTimeoutMs, but took ${elapsed}ms`)
+  assert.ok(
+    lines.some((line) => line.includes('transport closure could not be confirmed')),
+    'the unconfirmed closure must be logged, not swallowed',
+  )
+  // The child may still be alive: reuse must refuse rather than spawn a second one.
+  await assert.rejects(
+    () => withDeadline(connection.listTools(), 2_000, 'the refused reuse'),
+    (error) => error?.name === 'UnconfirmedCloseError' && /overlapping server processes/.test(error.message),
+  )
+  const teardown = Date.now()
+  await connection.close()
+  assert.ok(Date.now() - teardown < 500, 'close() on a poisoned connection must return at once')
+})
+
+await check(44, 'an invalid closeTimeoutMs keeps the plugin unmounted and names the field', async () => {
+  const expectUnmounted = async (serverName, serverConfig, needle) => {
+    const isolated = new Context()
+    isolated.plugin(SystemPrompt)
+    isolated.plugin(ToolRuntime, {})
+    await waitFor(() => isolated.tools !== undefined, 'the isolated tools service')
+    const lines = []
+    isolated.logger.exporter({
+      levels: { default: 99 },
+      export(message) {
+        for (const arg of message.args ?? []) {
+          lines.push(arg instanceof Error ? arg.message : String(arg))
+        }
+      },
+    })
+    isolated.plugin(plugin, { servers: { [serverName]: serverConfig } })
+    await waitFor(
+      () => lines.some((line) => line.includes(needle) && line.includes(`"${serverName}"`)),
+      `the mount error naming ${needle}`,
+    )
+    assert.ok(
+      !isolated.tools.schemas().some((entry) => entry.name.startsWith('mcp_')),
+      `a loader was registered despite ${needle}`,
+    )
+    await isolated.fiber.dispose()
+  }
+  await expectUnmounted(
+    'badclose',
+    { closeTimeoutMs: 0, command: process.execPath, args: [FIXTURE] },
+    '"closeTimeoutMs" must be a positive integer',
+  )
+  await expectUnmounted(
+    'badclose2',
+    { closeTimeoutMs: 1.5, command: process.execPath, args: [FIXTURE] },
+    '"closeTimeoutMs" must be a positive integer',
+  )
+})
+
 const failures = results.filter((entry) => entry.status === 'FAIL')
 for (const entry of results) {
   console.log(`${entry.status}  #${entry.id}  ${entry.title}${entry.detail ? `\n      ${entry.detail}` : ''}`)
