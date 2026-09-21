@@ -192,6 +192,26 @@ export interface Logger {
   error(message: string): void
 }
 
+/** One MCP resource operation this bridge can proxy, with server-owned cursors and URIs. */
+export type McpResourceRequest =
+  | { method: 'resources/list' | 'resources/templates/list'; cursor?: string }
+  | { method: 'resources/read'; uri: string }
+
+/**
+ * Result schema for one raw resource request.
+ *
+ * The resource runtime owns the model-facing shape; this bridge only carries the
+ * protocol answer across, so the schema accepts any JSON result — the same
+ * stance as raw `tools/call`.
+ */
+const RAW_RESOURCE_RESULT_SCHEMA: StandardSchemaV1<unknown, unknown> = {
+  '~standard': {
+    version: 1,
+    vendor: 'dsh-mcp-loader',
+    validate: (value: unknown) => ({ value }),
+  },
+}
+
 /** The subset of an MCP `tools/call` result this plugin reads. */
 export interface McpCallResult {
   content?: unknown
@@ -639,8 +659,7 @@ export class ServerConnection {
   }
 
   /** Send one `tools/call` under the caller's cancellation and the call deadline. */
-  async callTool(rawName: string, args: unknown, signal: AbortSignal): Promise<McpCallResult> {
-    const client = await this.client()
+  async callTool(rawName: string, args: unknown, signal: AbortSignal): Promise<McpCallResult> {    const client = await this.client()
     try {
       const result = await client.request(
         {
@@ -664,6 +683,42 @@ export class ServerConnection {
         this.#dropped = true
         await this.#closeGeneration(client, 'failed call')
         this.#logger.warn(`[tool-aggregator] MCP server "${this.name}" dropped after a failed call: ${messageOf(error)}`)
+      }
+      throw error
+    }
+  }
+
+  /**
+   * Proxy one MCP resource operation over the live connection.
+   *
+   * The result is handed back as it arrived (`unknown`): the resource runtime
+   * that consumes it owns the model-facing shape, exactly as with `tools/call`.
+   * A transport-level failure drops the client the same way a failed call does —
+   * a resource read is equally unrepeatable from our side.
+   */
+  async requestResources(request: McpResourceRequest, signal: AbortSignal): Promise<unknown> {
+    const client = await this.client()
+    try {
+      const params =
+        request.method === 'resources/read'
+          ? { uri: request.uri }
+          : request.cursor === undefined
+            ? {}
+            : { cursor: request.cursor }
+      return await client.request(
+        { method: request.method, params },
+        RAW_RESOURCE_RESULT_SCHEMA,
+        { signal, timeout: this.#toolCallTimeoutMs },
+      )
+    } catch (error) {
+      if (!signal.aborted) {
+        this.#client = undefined
+        this.#tools = undefined
+        this.#dropped = true
+        await this.#closeGeneration(client, 'failed resource request')
+        this.#logger.warn(
+          `[tool-aggregator] MCP server "${this.name}" dropped after a failed ${request.method}: ${messageOf(error)}`,
+        )
       }
       throw error
     }

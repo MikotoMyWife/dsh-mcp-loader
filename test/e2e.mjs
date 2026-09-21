@@ -77,6 +77,7 @@ const load = (rel) => import(pathToFileURL(`${DSH_PACKAGES}/${rel}`).href)
 const { Context } = await load('cordis/lib/index.js')
 const SystemPrompt = (await load('dsh-system-prompt/lib/index.js')).default
 const ToolRuntime = (await load('dsh-tools/lib/index.js')).default
+const McpResources = (await load('dsh-mcp-resources/lib/index.js')).default
 const { createScope } = await load('dsh-scope/lib/index.js')
 
 const pluginModule = await import(pathToFileURL(path.join(here, '..', 'lib', 'index.js')).href)
@@ -89,6 +90,7 @@ const ENV_SERVER = path.join(here, 'fixtures', 'env-server.mjs')
 const ODD_RESULT = path.join(here, 'fixtures', 'odd-result-server.mjs')
 const NO_TOOLS = path.join(here, 'fixtures', 'no-tools-server.mjs')
 const INSTRUCTIONS = path.join(here, 'fixtures', 'instructions-server.mjs')
+const RESOURCES_SERVER = path.join(here, 'fixtures', 'resources-server.mjs')
 const FIXTURE_TOOLS = [
   'mcp__fixture__add',
   'mcp__fixture__add_tool',
@@ -1736,6 +1738,110 @@ await check(50, 'instructions over maxInstructionBytes fail the load and name th
     assert.ok(
       !isolated.tools.schemas().some((entry) => entry.name.startsWith('mcp__longinstr__')),
       'a failed load must not register tools',
+    )
+  } finally {
+    await isolated.fiber.dispose()
+  }
+})
+
+await check(51, 'a loaded server publishes its resources through the host resource runtime', async () => {
+  const isolated = new Context()
+  isolated.plugin(SystemPrompt)
+  isolated.plugin(ToolRuntime, {})
+  isolated.plugin(McpResources)
+  await waitFor(() => isolated.tools !== undefined, 'the isolated tools service')
+  isolated.plugin(plugin, {
+    servers: {
+      res: {
+        description: 'Server with resources',
+        mode: 'lazy',
+        command: process.execPath,
+        args: [RESOURCES_SERVER],
+        env: { ECHO_LOG: file('res.log') },
+      },
+    },
+  })
+  try {
+    await waitFor(() => isolated.tools.schemas().some((entry) => entry.name === 'mcp_res'), 'the resources loader')
+    assert.ok(
+      !isolated.tools.schemas().some((entry) => entry.name === 'list_mcp_resources'),
+      'the shared resource tools must not exist before any server is expanded',
+    )
+    const loaded = await isolated.tools.execute({ callId: 'res-load', name: 'mcp_res', arguments: {}, signal })
+    assert.equal(loaded.isError, false, `the resources server must load: ${textOf(loaded)}`)
+    await waitFor(
+      () => isolated.tools.schemas().some((entry) => entry.name === 'list_mcp_resources'),
+      'the shared resource tools after a load',
+    )
+    const listed = await isolated.tools.execute({
+      callId: 'res-list',
+      name: 'list_mcp_resources',
+      arguments: { server: 'res' },
+      signal,
+    })
+    assert.equal(listed.isError, false, `listing resources must work: ${textOf(listed)}`)
+    assert.match(textOf(listed), /fixture:\/\/doc\/readme/, 'the server resource must be reachable')
+    const read = await isolated.tools.execute({
+      callId: 'res-read',
+      name: 'read_mcp_resource',
+      arguments: { server: 'res', uri: 'fixture://doc/readme' },
+      signal,
+    })
+    assert.equal(read.isError, false, `reading a resource must work: ${textOf(read)}`)
+    assert.match(textOf(read), /resource body from the fixture/, 'the resource body must come from the server')
+    assert.equal(countLines('res.log', 'read'), 1, 'exactly one resources/read must reach the server')
+    // Hiding the server withdraws its resource surface again.
+    const hidden = await isolated.tools.execute({ callId: 'res-hide', name: 'mcp_res', arguments: {}, signal })
+    assert.equal(hidden.isError, false, textOf(hidden))
+    await waitFor(
+      () => !isolated.tools.schemas().some((entry) => entry.name === 'list_mcp_resources'),
+      'the shared resource tools to disappear with the unload',
+    )
+  } finally {
+    await isolated.fiber.dispose()
+  }
+})
+
+await check(52, 'without the resource runtime the plugin still loads servers and says so once', async () => {
+  const isolated = new Context()
+  isolated.plugin(SystemPrompt)
+  isolated.plugin(ToolRuntime, {})
+  await waitFor(() => isolated.tools !== undefined, 'the isolated tools service')
+  const lines = []
+  isolated.logger.exporter({
+    levels: { default: 99 },
+    export(message) {
+      for (const arg of message.args ?? []) {
+        lines.push(arg instanceof Error ? arg.message : String(arg))
+      }
+    },
+  })
+  isolated.plugin(plugin, {
+    servers: {
+      resalone: {
+        description: 'Server loaded without a resource runtime',
+        mode: 'lazy',
+        command: process.execPath,
+        args: [RESOURCES_SERVER],
+      },
+    },
+  })
+  try {
+    await waitFor(() => isolated.tools.schemas().some((entry) => entry.name === 'mcp_resalone'), 'the loader')
+    const loaded = await isolated.tools.execute({ callId: 'resalone-load', name: 'mcp_resalone', arguments: {}, signal })
+    assert.equal(loaded.isError, false, `the load must succeed without the runtime: ${textOf(loaded)}`)
+    assert.ok(
+      isolated.tools.schemas().some((entry) => entry.name === 'mcp__resalone__ping'),
+      'the tools must still register',
+    )
+    assert.ok(
+      !isolated.tools.schemas().some((entry) => entry.name === 'list_mcp_resources'),
+      'no resource tool may appear without the runtime',
+    )
+    assert.equal(
+      lines.filter((line) => line.includes('no mcpResources service in this composition')).length,
+      1,
+      'the unbridged case must be explained exactly once',
     )
   } finally {
     await isolated.fiber.dispose()

@@ -77,6 +77,10 @@ loader, so every server is per-session).
 - **Discovery hard caps** — per server, a real discovery is bounded by `maxToolListPages` pages, `maxToolsPerServer`
   raw tools and a `discoveryTimeoutMs` deadline; exceeding any of them fails the load/re-sync with an error naming
   the server and the reason, keeps the loader tool, and is never retried.
+- **Resource bridge (optional)** — when the composition provides the harness resource service (`mcpResources`),
+  a server that a session has expanded also publishes its resources: the shared `list_mcp_resources` /
+  `list_mcp_resource_templates` / `read_mcp_resource` tools proxy to that connection, and hiding the server again
+  withdraws the surface. Without the service the plugin loads servers as usual and says so once.
 - **Ordered re-syncs** — a per-server monotonic discovery generation makes sure two concurrent `list_changed`
   re-syncs (or a re-sync racing a load) can never have an older snapshot land after — and overwrite — a newer one:
   a stale discovery result is discarded instead of being applied.
@@ -207,9 +211,10 @@ are deterministic and are never retried.
 - Only one bridge may serve a given server name: each configured name is claimed at mount time, and a second
   instance (another mount of this plugin, or the official `dsh-mcp-client` on the same name) is refused with a
   named error instead of silently failing to register — registration is global, so the public tool names would collide.
-- Images/audio become `[image image/png]` text placeholders and only tools are bridged: MCP resources, prompts,
-  progress and task-typed tools are out of scope. This is a deliberate divergence — the official
-  `dsh-mcp-client` 0.1.6 projects images through attachment blocks and bridges resources via `dsh-mcp-resources`.
+- Images/audio become `[image image/png]` text placeholders and only tools are bridged: MCP resources are bridged
+  only through the optional resource service described above, while prompts, progress and task-typed tools are out
+  of scope. Images are a deliberate divergence — the official `dsh-mcp-client` 0.1.6 projects them through
+  attachment blocks.
 - A server that never declares the `tools` capability loads as an empty catalogue (logged once, loader kept) and
   is never asked for a tool list, so a resources-only server does not fail every load.
 - Reconnection is bounded and lazy: one user-visible operation (a loader load, a tool call, a startup probe) draws

@@ -28,7 +28,7 @@
  * never masked because nothing could ever reveal it again.
  */
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
-import { ServerConnection, messageOf, validateServerConfig, type Logger } from './connection.js'
+import { ServerConnection, messageOf, validateServerConfig, type Logger, type McpResourceRequest } from './connection.js'
 import { PRESET_PARAMETER_DESCRIPTION_CAP, descriptionOverridesFor } from './presets.js'
 import type { DiscoveredTool, PluginConfig, ServerConfig } from './types.js'
 
@@ -52,6 +52,18 @@ export const inject = ['tools']
  * collision is global by construction.
  */
 const claimedServerNames = new WeakMap<object, Set<string>>()
+
+/**
+ * The host's resource runtime, as this plugin consumes it.
+ *
+ * Typed structurally instead of importing `@deepseek-ai/dsh-mcp-resources`, so
+ * the plugin keeps its "no DSH package at runtime" property: the service is
+ * reached through the context, and a composition without it simply leaves MCP
+ * resources unbridged.
+ */
+interface McpResourceRuntimeLike {
+  register(server: string, provider: { request(request: unknown, exec: unknown): Promise<unknown> }): () => void
+}
 
 /** Whether a rule string contains glob metacharacters. */
 function isGlobRule(rule: string): boolean {
@@ -205,6 +217,67 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
   const idleTimers = new Map<string, NodeJS.Timeout>()
   /** server name -> how many idle disconnects have fired for it (log counter) */
   const idleDisconnectCount = new Map<string, number>()
+  /** server name -> resource-provider deregistration for the loaded server */
+  const resourceDisposers = new Map<string, () => void>()
+  /** The host's resource runtime, once (and if) the composition provides one. */
+  let resourceRuntime: McpResourceRuntimeLike | undefined
+  /** Whether the "no resource runtime" notice was already logged. */
+  let resourceUnavailableLogged = false
+
+  /**
+   * Make a loaded server's resources reachable through the host's resource
+   * runtime, when one is composed.
+   *
+   * Registration is lazy on purpose: a server that was never expanded should not
+   * publish a resource surface, and a composition without the runtime keeps
+   * working with a single informational line instead of an error.
+   */
+  function ensureResourceProvider(serverName: string): void {
+    if (resourceRuntime === undefined) {
+      if (!resourceUnavailableLogged) {
+        resourceUnavailableLogged = true
+        logger.info('[tool-aggregator] no mcpResources service in this composition; MCP resources stay unbridged')
+      }
+      return
+    }
+    if (resourceDisposers.has(serverName)) return
+    const connection = connections.get(serverName)
+    if (connection === undefined) return
+    try {
+      resourceDisposers.set(
+        serverName,
+        resourceRuntime.register(serverName, {
+          request: (request: unknown, exec: unknown) =>
+            connection.requestResources(
+              request as McpResourceRequest,
+              (exec as { signal?: AbortSignal } | undefined)?.signal ?? new AbortController().signal,
+            ),
+        }),
+      )
+    } catch (error) {
+      logger.warn(`[tool-aggregator] registering resources of "${serverName}" failed: ${messageOf(error)}`)
+    }
+  }
+
+  /** Withdraw a server's resource provider (unload or teardown). */
+  function disposeResourceProvider(serverName: string): void {
+    const dispose = resourceDisposers.get(serverName)
+    if (dispose === undefined) return
+    resourceDisposers.delete(serverName)
+    try {
+      dispose()
+    } catch (error) {
+      logger.warn(`[tool-aggregator] disposing resources of "${serverName}" failed: ${messageOf(error)}`)
+    }
+  }
+
+  // The resource runtime is an optional peer: `inject` waits for it without
+  // failing this plugin, and servers already loaded when it appears (or that load
+  // later) publish their provider through the same path.
+  ctx.inject(['mcpResources'], (inner: { mcpResources: McpResourceRuntimeLike }) => {
+    resourceRuntime = inner.mcpResources
+    for (const serverName of loaded.keys()) ensureResourceProvider(serverName)
+  })
 
   /** Cancel a server's pending idle-disconnect timer, if any. */
   function clearIdleTimer(serverName: string): void {
@@ -671,6 +744,9 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
         clearIdleTimer(connection.name)
         syncAgents(caller)
         logger.info(`[tool-aggregator] loaded ${generation.disposers.size} tool(s) from "${connection.name}"`)
+        // A loaded server becomes reachable for resource reads too; an empty
+        // generation (no tools) registers no provider, matching "nothing loaded".
+        ensureResourceProvider(connection.name)
         return generation
       } catch (error) {
         // A failed load may still have left the connection established while no
@@ -698,6 +774,7 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     loaded.delete(serverName)
     hideMasks.delete(serverName)
     holders.delete(serverName)
+    disposeResourceProvider(serverName)
     for (const dispose of generation.disposers.values()) {
       try {
         dispose()
@@ -1006,6 +1083,7 @@ export function apply(ctx: any, config: PluginConfig = {}): void {
     }
     loaded.clear()
     pending.clear()
+    for (const serverName of [...resourceDisposers.keys()]) disposeResourceProvider(serverName)
     discoveryVersions.clear()
     landedVersions.clear()
     holders.clear()

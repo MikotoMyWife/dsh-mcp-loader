@@ -78,6 +78,14 @@ export interface Logger {
     warn(message: string): void;
     error(message: string): void;
 }
+/** One MCP resource operation this bridge can proxy, with server-owned cursors and URIs. */
+export type McpResourceRequest = {
+    method: 'resources/list' | 'resources/templates/list';
+    cursor?: string;
+} | {
+    method: 'resources/read';
+    uri: string;
+};
 /** The subset of an MCP `tools/call` result this plugin reads. */
 export interface McpCallResult {
     content?: unknown;
@@ -138,6 +146,15 @@ export declare class ServerConnection {
     listTools(force?: boolean): Promise<DiscoveredTool[]>;
     /** Send one `tools/call` under the caller's cancellation and the call deadline. */
     callTool(rawName: string, args: unknown, signal: AbortSignal): Promise<McpCallResult>;
+    /**
+     * Proxy one MCP resource operation over the live connection.
+     *
+     * The result is handed back as it arrived (`unknown`): the resource runtime
+     * that consumes it owns the model-facing shape, exactly as with `tools/call`.
+     * A transport-level failure drops the client the same way a failed call does —
+     * a resource read is equally unrepeatable from our side.
+     */
+    requestResources(request: McpResourceRequest, signal: AbortSignal): Promise<unknown>;
     /** Register the single re-sync listener for this connection. */
     onToolsChanged(listener: () => void): void;
     /** Connection state without triggering a connection. */
