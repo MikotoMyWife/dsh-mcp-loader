@@ -62,6 +62,12 @@
  * | 45| a real stdio child's environment (`envprobe`)             | credentials and DSH_* withheld; proxy variables, NODE_USE_ENV_PROXY, NPM_CONFIG_* and the configured env overlay reach it |
  * | 46| a second instance claiming one server name                | refused at mount by name; the first instance keeps working    |
  * | 47| a spec-invalid `tools/call` result (`odd`)                | still reaches the renderer: the result schema stays ours, the client library's spec validator is bypassed |
+ * | 48| a server without the `tools` capability (`notools`)        | loads as an empty catalogue, logs it once, never asked to list |
+ * | 49| a server that ships `instructions` (`instructionssrv`)     | instructions appear in the load result, attributed to their server |
+ * | 50| instructions over `maxInstructionBytes`                    | the load fails naming the limit, the loader survives, no tools register |
+ * | 51| a loaded server with resources (`res`) + the real runtime  | shared resource tools appear after the load, list/read reach the server, withdrawn on unload |
+ * | 52| no resource runtime composed                               | the plugin loads as usual, no resource tools, one explanatory line |
+ * | 53| an `auto` server whose handshake hangs (`hangboot`)        | mount registers the loader without waiting for the child; nothing is revealed |
  */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -1842,6 +1848,57 @@ await check(52, 'without the resource runtime the plugin still loads servers and
       lines.filter((line) => line.includes('no mcpResources service in this composition')).length,
       1,
       'the unbridged case must be explained exactly once',
+    )
+  } finally {
+    await isolated.fiber.dispose()
+  }
+})
+
+await check(53, 'mounting never waits for an MCP child: a hanging probe server cannot block boot', async () => {
+  const isolated = new Context()
+  isolated.plugin(SystemPrompt)
+  isolated.plugin(ToolRuntime, {})
+  await waitFor(() => isolated.tools !== undefined, 'the isolated tools service')
+  const lines = []
+  isolated.logger.exporter({
+    levels: { default: 99 },
+    export(message) {
+      for (const arg of message.args ?? []) {
+        lines.push(arg instanceof Error ? arg.message : String(arg))
+      }
+    },
+  })
+  // The probe connects on mount and this child never answers; the default
+  // connectTimeoutMs is 30s, so a mount that waited for it could not be visible
+  // inside the deadline below.
+  const mountedAt = Date.now()
+  isolated.plugin(plugin, {
+    servers: {
+      hangboot: {
+        description: 'Server whose handshake never completes',
+        mode: 'auto',
+        command: process.execPath,
+        args: ['-e', 'setTimeout(() => {}, 1e9)'],
+      },
+    },
+  })
+  try {
+    await waitFor(
+      () => isolated.tools.schemas().some((entry) => entry.name === 'mcp_hangboot'),
+      'the loader to appear without waiting for the probe',
+      1500,
+    )
+    assert.ok(
+      Date.now() - mountedAt < 1500,
+      'the loader must be registered while the MCP child is still connecting',
+    )
+    assert.ok(
+      !isolated.tools.schemas().some((entry) => entry.name.startsWith('mcp__hangboot__')),
+      'a server that never answered must not reveal tools',
+    )
+    assert.ok(
+      lines.some((line) => line.includes('registered')),
+      'mount must still log its loader registration',
     )
   } finally {
     await isolated.fiber.dispose()
