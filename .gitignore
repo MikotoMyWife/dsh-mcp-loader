@@ -6,6 +6,7 @@
 !/src/
 !/lib/
 !/test/
+!/locale/
 # Files required to build, install, publish or work in this repository.
 !/.gitignore
 !/LICENSE
@@ -18,6 +19,7 @@
 !/src/**
 !/lib/**
 !/test/**
+!/locale/**
 # Root-level local-only files that must never enter the repository.
 /src/x.ts
 /lib/x.*

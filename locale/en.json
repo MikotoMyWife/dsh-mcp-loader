@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "MCP Loader",
+    "description": "Lazy-loading MCP tools for DeepSeek Harness (DSH): one loader tool per multi-tool MCP server, per-agent tool masking and description presets."
+  }
+}

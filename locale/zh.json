@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "MCP 加载器",
+    "description": "DSH 的 MCP 懒加载工具：每个多工具 MCP 服务器一个加载器工具，支持按 agent 屏蔽工具与描述预设。"
+  }
+}

@@ -24,7 +24,8 @@
     "lib",
     "cordis.patch.yml",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "locale"
   ],
   "engines": {
     "node": ">=20"
