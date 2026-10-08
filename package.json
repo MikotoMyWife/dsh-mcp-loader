@@ -37,7 +37,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "node test/e2e.mjs"
+    "test": "node test/packaging.mjs && node test/e2e.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/client": "^2.0.0"
